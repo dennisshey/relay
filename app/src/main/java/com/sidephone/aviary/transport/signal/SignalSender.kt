@@ -37,9 +37,12 @@ class SignalSender(
     data class Quote(val targetTimestamp: Long, val authorAci: String, val text: String)
 
     /** Send a 1:1 message with the given (already-recorded) timestamp. */
-    fun sendDirect(recipientAci: String, body: String, ts: Long, quote: Quote? = null): Result<Unit> =
+    fun sendDirect(
+        recipientAci: String, body: String, ts: Long, quote: Quote? = null,
+        mentions: List<Triple<Int, Int, String>> = emptyList(),
+    ): Result<Unit> =
         runCatching {
-            val dataMessage = dataMessage(body, ts, null, quote)
+            val dataMessage = dataMessage(body, ts, null, quote, mentions)
             sendContent(recipientAci, content(dataMessage), ts, null).getOrThrow()
             syncSent(dataMessage, ts, recipientAci)
         }
@@ -47,11 +50,12 @@ class SignalSender(
     /** Send a group message to every member with the given timestamp. */
     fun sendGroup(
         masterKey: ByteArray, group: SignalGroups.Info, body: String, ts: Long, quote: Quote? = null,
+        mentions: List<Triple<Int, Int, String>> = emptyList(),
     ): Result<Unit> =
         runCatching {
             val groupContext = MiniProto.Writer().bytes(1, masterKey)
                 .varint(2, group.revision.toLong()).toByteArray()
-            val dataMessage = dataMessage(body, ts, groupContext, quote)
+            val dataMessage = dataMessage(body, ts, groupContext, quote, mentions)
             val padded = content(dataMessage)
             val self = account.aci
             var anySent = false
@@ -274,10 +278,20 @@ class SignalSender(
 
     private fun dataMessage(
         body: String, ts: Long, groupContext: ByteArray?, quote: Quote? = null,
+        mentions: List<Triple<Int, Int, String>> = emptyList(),
     ): ByteArray =
         MiniProto.Writer().string(1, body).varint(7, ts)
             .also { if (quote != null) it.bytes(8, quoteProto(quote)) } // DataMessage.quote
             .also { if (groupContext != null) it.bytes(15, groupContext) }
+            // DataMessage.bodyRanges (repeated field 5). Each mention: start(1), length(2) over the
+            // U+FFFC placeholder in body, and mentionAci(3) as the ACI UUID string.
+            .also { w ->
+                mentions.forEach { (start, len, aci) ->
+                    w.bytes(5, MiniProto.Writer()
+                        .varint(1, start.toLong()).varint(2, len.toLong()).string(3, aci)
+                        .toByteArray())
+                }
+            }
             .toByteArray()
 
     /**

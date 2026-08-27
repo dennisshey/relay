@@ -112,6 +112,49 @@ class SignalTransport(
 
     override suspend fun sendText(
         conversation: ConversationEntity, body: String, replyTo: MessageEntity?,
+    ): Result<Unit> = deliver(conversation, recordBody = body, wireBody = body, replyTo = replyTo)
+
+    /** An @-mention inserted from the group member picker: which ACI, and the exact "@Name" text. */
+    data class Mention(val aci: String, val token: String)
+
+    /**
+     * Send [body] (with visible "@Name" tokens) to a group, turning each mention into Signal's wire
+     * form: the "@Name" text becomes a single U+FFFC placeholder plus a bodyRange carrying the ACI.
+     * The locally-recorded message keeps the readable "@Name" text.
+     */
+    suspend fun sendTextWithMentions(
+        conversation: ConversationEntity, body: String, replyTo: MessageEntity?, mentions: List<Mention>,
+    ): Result<Unit> {
+        if (mentions.isEmpty()) return deliver(conversation, body, body, replyTo)
+        val (wireBody, ranges) = toWire(body, mentions)
+        return deliver(conversation, recordBody = body, wireBody = wireBody, replyTo = replyTo, mentions = ranges)
+    }
+
+    /** Turn "@Name" tokens in [display] into U+FFFC + (start,length,aci) ranges over the wire body. */
+    private fun toWire(display: String, mentions: List<Mention>): Pair<String, List<Triple<Int, Int, String>>> {
+        val sb = StringBuilder()
+        val ranges = mutableListOf<Triple<Int, Int, String>>()
+        val remaining = mentions.toMutableList()
+        var i = 0
+        while (i < display.length) {
+            val hit = remaining.firstOrNull {
+                it.token.isNotEmpty() && display.regionMatches(i, it.token, 0, it.token.length)
+            }
+            if (hit != null) {
+                ranges.add(Triple(sb.length, 1, hit.aci))
+                sb.append('\uFFFC')
+                i += hit.token.length
+                remaining.remove(hit)
+            } else {
+                sb.append(display[i]); i++
+            }
+        }
+        return sb.toString() to ranges
+    }
+
+    private suspend fun deliver(
+        conversation: ConversationEntity, recordBody: String, wireBody: String,
+        replyTo: MessageEntity?, mentions: List<Triple<Int, Int, String>> = emptyList(),
     ): Result<Unit> {
         if (!account.isRegistered) {
             return Result.failure(IllegalStateException("Link Signal first"))
@@ -120,20 +163,12 @@ class SignalTransport(
         // update the status when the network call resolves.
         val ts = System.currentTimeMillis()
         val externalId = "out:$ts"
-        Log.i("SignalReply", "SEND ts=$ts extId=$externalId body='${body.take(24)}'")
+        Log.i("SignalReply", "SEND ts=$ts extId=$externalId body='${recordBody.take(24)}'")
         // An inline reply carries a Quote naming the target's author + sent timestamp.
         val quote = replyTo?.let {
             val authorAci = if (it.outgoing) account.aci else it.sender
             if (authorAci == null) null
             else SignalSender.Quote(it.timestamp, authorAci, it.body)
-        }
-        if (replyTo != null) {
-            Log.i(
-                "SignalReply",
-                "quote target: extId=${replyTo.externalId} outgoing=${replyTo.outgoing} " +
-                    "sender=${replyTo.sender} ts=${replyTo.timestamp} myAci=${account.aci} " +
-                    "-> author=${quote?.authorAci} id=${quote?.targetTimestamp}",
-            )
         }
         repo.recordMessage(
             MessageEntity(
@@ -141,7 +176,7 @@ class SignalTransport(
                 transportId = ID,
                 externalId = externalId,
                 sender = "me",
-                body = body,
+                body = recordBody,
                 timestamp = ts,
                 outgoing = true,
                 status = MessageStatus.PENDING,
@@ -160,10 +195,10 @@ class SignalTransport(
                 if (group.memberAcis.isEmpty()) {
                     Result.failure(IllegalStateException("Couldn't load group members"))
                 } else {
-                    sender.sendGroup(masterKey, group, body, ts, quote)
+                    sender.sendGroup(masterKey, group, wireBody, ts, quote, mentions)
                 }
             } else {
-                sender.sendDirect(conversation.externalId, body, ts, quote)
+                sender.sendDirect(conversation.externalId, wireBody, ts, quote, mentions)
             }
             repo.setStatusByExternal(
                 ID, externalId,

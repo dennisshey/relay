@@ -447,17 +447,24 @@ class SignalReceiver(
             }
         }
 
-        // Mentions (DataMessage.bodyRanges, repeated field 5): true if any range @-mentions our
-        // own ACI — used to let a muted (Secondary) group still notify.
-        val mentioned = dm.asSequence()
+        // Mentions (DataMessage.bodyRanges, repeated field 5). Each range: start(1), length(2), and
+        // mentionAci(3) as a string or a 16-byte ServiceId. Signal puts a single U+FFFC placeholder
+        // in the body at each mention; we resolve the ACI to a name and swap the placeholder for
+        // "@Name". A range that @-mentions our own ACI also flags the message so a muted (Secondary)
+        // group still notifies. Returns (start, length, aci) per range.
+        val mentionRanges: List<Triple<Int, Int, String>> = dm.asSequence()
             .filter { it.number == 5 && it.bytes != null }
-            .any { br ->
+            .mapNotNull { br ->
                 val f = MiniProto.parse(br.bytes!!)
-                val aciStr = MiniProto.stringField(f, 3)
-                (aciStr != null && aciStr.equals(account.aci, ignoreCase = true)) ||
-                    (MiniProto.bytesField(f, 3)?.let { serviceIdToUuid(it) }
-                        ?.equals(account.aci, ignoreCase = true) == true)
-            }
+                val aci = MiniProto.stringField(f, 3)
+                    ?: MiniProto.bytesField(f, 3)?.let { serviceIdToUuid(it) }
+                    ?: return@mapNotNull null
+                val start = (MiniProto.varintField(f, 1) ?: 0L).toInt()
+                val length = (MiniProto.varintField(f, 2) ?: 1L).toInt()
+                Triple(start, length, aci)
+            }.toList()
+        val mentioned = mentionRanges.any { it.third.equals(account.aci, ignoreCase = true) }
+        val renderedText = applyMentions(text, mentionRanges)
 
         val msgSender = if (outgoing) "me" else fromAci
         val msgExternalId = if (outgoing) "out:$ts" else "$fromAci:$ts"
@@ -466,7 +473,7 @@ class SignalReceiver(
                 externalId = "group:" + Base64.encodeToString(groupMasterKey, Base64.NO_WRAP),
                 title = "Signal group", address = "group",
                 messageSender = msgSender, messageExternalId = msgExternalId,
-                text = text ?: "", ts = ts, outgoing = outgoing,
+                text = renderedText, ts = ts, outgoing = outgoing,
                 mediaPath = mediaPath, mediaType = mediaType,
                 replyToExternalId = replyToExternalId, replyToPreview = replyToPreview,
                 mentioned = mentioned,
@@ -480,7 +487,7 @@ class SignalReceiver(
                 title = contactNames.get(convoAci) ?: fromE164 ?: "Signal user",
                 address = fromE164 ?: convoAci,
                 messageSender = msgSender, messageExternalId = msgExternalId,
-                text = text ?: "", ts = ts, outgoing = outgoing,
+                text = renderedText, ts = ts, outgoing = outgoing,
                 mediaPath = mediaPath, mediaType = mediaType,
                 replyToExternalId = replyToExternalId, replyToPreview = replyToPreview,
                 mentioned = mentioned,
@@ -496,6 +503,24 @@ class SignalReceiver(
             resolveGroupName(groupMasterKey, convo.id, convo.externalId)
         }
     }
+
+    /** Replace each mention's U+FFFC placeholder in [body] with "@Name". Ranges are (start, len, aci). */
+    private fun applyMentions(body: String?, ranges: List<Triple<Int, Int, String>>): String {
+        val text = body ?: return ""
+        if (ranges.isEmpty()) return text
+        var out = text
+        // Apply from the end so earlier character offsets stay valid as we substitute.
+        for ((start, length, aci) in ranges.sortedByDescending { it.first }) {
+            if (start < 0 || length < 0 || start + length > out.length) continue
+            out = out.substring(0, start) + "@" + mentionName(aci) + out.substring(start + length)
+        }
+        return out
+    }
+
+    /** Display name for an @-mentioned ACI: our own → "you", else the known contact/profile name. */
+    private fun mentionName(aci: String): String =
+        if (aci.equals(account.aci, ignoreCase = true)) "you"
+        else contactNames.get(aci) ?: "someone"
 
     private suspend fun recordInto(
         externalId: String, title: String, address: String,

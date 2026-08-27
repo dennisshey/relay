@@ -112,6 +112,10 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
     val listState = rememberLazyListState()
     val snackbar = remember { SnackbarHostState() }
     var draft by remember(conversationId) { mutableStateOf("") }
+    // @-mentions inserted via the group picker for the current draft (Signal groups only).
+    val draftMentions = remember(conversationId) {
+        androidx.compose.runtime.mutableStateListOf<com.sidephone.aviary.transport.signal.SignalTransport.Mention>()
+    }
     var draftSeeded by remember(conversationId) { mutableStateOf(false) }
     // Seed the composer from the persisted draft once, then keep it saved (debounced) so it
     // survives leaving the thread or the process being killed.
@@ -393,10 +397,23 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                     }
                 }
             }
+            // @-mention candidates: only for Signal group threads — distinct members who've spoken,
+            // paired with the name we know for them.
+            val mentionCandidates = if (convo?.isGroup == true && sendProtocol == Protocol.SIGNAL) {
+                messages.asSequence()
+                    .filter { !it.outgoing && it.transportId == "signal" && !it.sender.isNullOrBlank() }
+                    .map { it.sender!! }.distinct()
+                    .mapNotNull { aci -> app.contactNames.get(aci)?.let { aci to it } }
+                    .toList()
+            } else emptyList()
             Composer(
                 draft = draft,
                 onDraftChange = { draft = it },
                 sendProtocol = sendProtocol,
+                mentionCandidates = mentionCandidates,
+                onMentionInserted = { aci, token ->
+                    draftMentions.add(com.sidephone.aviary.transport.signal.SignalTransport.Mention(aci, token))
+                },
                 onAttach = { attachMenuOpen = true },
                 onSendVoice = { bytes ->
                     scope.launch {
@@ -408,7 +425,9 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                 },
                 onSend = {
                     val text = draft.trim()
+                    val mentions = draftMentions.toList()
                     draft = ""
+                    draftMentions.clear()
                     val reply = replyingTo
                     val editing = editingMessage
                     replyingTo = null
@@ -419,9 +438,12 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                             app.transports.byId(editing.transportId)?.editMessage(c, editing, text)
                                 ?.onFailure { e -> snackbar.showSnackbar(e.message ?: "Edit failed") }
                         } else {
-                            app.router.resolve(c).sendText(c, text, reply).onFailure { e ->
-                                snackbar.showSnackbar(e.message ?: "Send failed")
-                            }
+                            val t = app.router.resolve(c)
+                            val result = if (t is com.sidephone.aviary.transport.signal.SignalTransport
+                                && mentions.isNotEmpty()
+                            ) t.sendTextWithMentions(c, text, reply, mentions)
+                            else t.sendText(c, text, reply)
+                            result.onFailure { e -> snackbar.showSnackbar(e.message ?: "Send failed") }
                         }
                     }
                 }
@@ -956,6 +978,8 @@ private fun Composer(
     onAttach: () -> Unit,
     onSend: () -> Unit,
     onSendVoice: (ByteArray) -> Unit,
+    mentionCandidates: List<Pair<String, String>> = emptyList(), // (aci, display name)
+    onMentionInserted: (aci: String, token: String) -> Unit = { _, _ -> },
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val recorder = remember { com.sidephone.aviary.data.VoiceRecorder(context) }
@@ -1002,6 +1026,38 @@ private fun Composer(
         return
     }
 
+    // Active @-mention query: a trailing "@word" (start- or space-anchored) with no space after it.
+    // Only in group chats that supply candidates (Signal). Suggests matching members to insert.
+    val atMatch = if (mentionCandidates.isNotEmpty())
+        Regex("(?:^|\\s)@([\\p{L}0-9._-]*)$").find(draft) else null
+    val mentionQuery = atMatch?.groupValues?.get(1)
+    val suggestions = if (mentionQuery != null)
+        mentionCandidates.filter { it.second.contains(mentionQuery, ignoreCase = true) }.take(6)
+    else emptyList()
+
+    Column(Modifier.fillMaxWidth()) {
+        if (suggestions.isNotEmpty()) {
+            androidx.compose.material3.Surface(
+                tonalElevation = 3.dp, shadowElevation = 4.dp,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.padding(horizontal = 12.dp).fillMaxWidth(),
+            ) {
+                Column {
+                    suggestions.forEach { (aci, name) ->
+                        Text(
+                            "@$name",
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                val at = atMatch ?: return@clickable
+                                val atIndex = at.range.first + at.value.indexOf('@')
+                                onDraftChange(draft.substring(0, atIndex) + "@" + name + " ")
+                                onMentionInserted(aci, "@$name")
+                            }.padding(horizontal = 16.dp, vertical = 12.dp),
+                        )
+                    }
+                }
+            }
+        }
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Bottom
@@ -1067,6 +1123,7 @@ private fun Composer(
             }
         }
     }
+    } // Column (mention dropdown + input row)
 }
 
 /**
