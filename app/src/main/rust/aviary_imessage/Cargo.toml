@@ -1,0 +1,36 @@
+[package]
+name = "aviary_imessage"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustpush = { path = "/private/tmp/claude-501/-Users-dennis-Documents-Coding-messaging/20c22d79-8c6d-4510-9c81-279f34a01ab2/scratchpad/rustpush", features = ["macos-validation-data", "local-anisette"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+jni = "0.21"
+log = "0.4"
+android_logger = "0.14"
+# Same omnisette path as rustpush's dep (cargo unifies path deps → one crate instance),
+# so the local anisette provider types match rustpush's.
+omnisette = { path = "/private/tmp/claude-501/-Users-dennis-Documents-Coding-messaging/20c22d79-8c6d-4510-9c81-279f34a01ab2/scratchpad/rustpush/third_party/apple-private-apis/omnisette", features = ["local-anisette"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1.7"
+base64 = "0.22"
+sha2 = "0.10"
+# Same keystore path as rustpush's dep → one crate instance; we init its global.
+keystore = { path = "/private/tmp/claude-501/-Users-dennis-Documents-Coding-messaging/20c22d79-8c6d-4510-9c81-279f34a01ab2/scratchpad/rustpush/keystore" }
+# x86-64 CPU emulator for on-device NAC (running Apple's IMDAppleServices).
+# Requires the android_arm64.cmake toolchain + stublibs (see build env vars).
+unicorn-engine = "2.1"
+# Pin h3/h3-quinn to the versions compatible with rustpush's vendored quinn 0.11.7
+# (newer h3-quinn requires quinn >=0.11.9, which breaks the patch).
+h3 = "=0.0.8"
+h3-quinn = "=0.0.10"
+
+# rustpush patches quinn to its vendored copy; [patch] only applies from the build
+# root, so we must replicate it here (this crate is the root).
+[patch.crates-io]
+quinn = { path = "/private/tmp/claude-501/-Users-dennis-Documents-Coding-messaging/20c22d79-8c6d-4510-9c81-279f34a01ab2/scratchpad/rustpush/third_party/quinn/quinn" }

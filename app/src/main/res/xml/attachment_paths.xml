@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Decrypted attachments we hand to an external viewer on tap. -->
+    <files-path name="media" path="media/" />
+    <files-path name="imessage_attachments" path="imessage/attachments/" />
+</paths>

@@ -1,0 +1,58 @@
+name: Build Release APK
+
+# Builds a signed release APK. Runs on every push to main (artifact only) and, when you push a
+# version tag like `v0.1.0`, also publishes the APK to a GitHub Release.
+#
+# The native library (app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so) is committed prebuilt —
+# its Rust source (OpenBubbles' rustpush) lives outside this repo, so CI only runs Gradle.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Stage APK with a friendly name
+        id: stage
+        run: |
+          SRC=app/build/outputs/apk/release/app-release.apk
+          NAME="relay-${GITHUB_REF_NAME}.apk"
+          cp "$SRC" "$NAME"
+          echo "apk=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-apk
+          path: ${{ steps.stage.outputs.apk }}
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.stage.outputs.apk }}
+          generate_release_notes: true

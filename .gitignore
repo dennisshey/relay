@@ -1,0 +1,20 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+/captures
+.externalNativeBuild
+.cxx
+
+# Rust JNI crate build artifacts (multi-GB cargo cache). The prebuilt native library is
+# committed under app/src/main/jniLibs instead, since rustpush's source lives outside this repo.
+app/src/main/rust/**/target/
+**/target/
+
+# Rust native build inputs that are (a) proprietary Apple binaries and (b) not needed by CI or the
+# APK (the compiled library is committed under jniLibs; rebuilding also needs out-of-tree rustpush).
+app/src/main/rust/**/apple_libs/
+app/src/main/rust/**/vendor/
+app/src/main/rust/**/*.so
