@@ -1,53 +1,63 @@
 # Relay
 
-One inbox for all my messages — SMS/MMS, iMessage, Signal, and Instagram DMs — running entirely on the phone. There's no relay server in the middle despite the name; everything talks straight to each service, and your credentials and messages never leave the device except as that service's own normal traffic.
+One inbox for everything I text on: SMS/MMS, iMessage, Signal, and Instagram DMs, all running on the phone itself. The name is a bit of a misnomer, since there's no relay server in the middle. Each account talks straight to its own service, and nothing of mine (logins, messages) lands on anyone else's machine.
 
-I built it for my Sidephone SP-01 (arm64, Android 12), but it's a regular Android app.
+I wrote it for my Sidephone SP-01 (arm64, Android 12), but it's an ordinary Android app.
 
 ## Why
 
-I was tired of juggling four apps, and I especially didn't want a middleman server holding my logins to make iMessage work on Android. Most of the options out there (Beeper, AirMessage, the usual OpenBubbles setups) lean on a Mac you leave running or a server somewhere. I wanted the whole thing to happen locally, on the phone, with nothing of mine sitting on someone else's box.
+I was sick of bouncing between four apps, and I really didn't want some middleman server holding my Apple login just to get iMessage on Android. The existing options (Beeper, AirMessage, most OpenBubbles setups) lean on a Mac you keep running or a server somewhere. I wanted it all to happen locally, on the phone, with none of my stuff sitting on a box I don't control.
 
-## The iMessage part
+## iMessage
 
-This is the interesting bit, so it's worth explaining.
+This is the part worth explaining.
 
-Getting iMessage working on a non-Apple device means convincing Apple's identity servers that you're a real Apple device. Normally that's done by a Mac or a server that signs things for you. Relay does all of it on the phone instead, built on top of OpenBubbles' [rustpush](https://github.com/OpenBubbles/rustpush) engine with a thin JNI layer around it.
+Running iMessage on a non-Apple device comes down to convincing Apple's identity servers that you're a real Apple device. Usually a Mac or a server does that signing for you. Relay does it on the phone, on top of OpenBubbles' [rustpush](https://github.com/OpenBubbles/rustpush) engine with a thin JNI layer wrapped around it.
 
-Here's the chain that runs locally when you sign in:
+What runs locally when you sign in:
 
-- **Activation.** The app activates against Apple's `albert.apple.com` using a bundled Apple device certificate, and gets back a real device cert and a push token — the same handshake a genuine device does.
-- **Anisette.** Apple wants some device-attestation headers on every request. Instead of phoning a public anisette server for those (which is what a lot of clients do), Relay loads Apple's own `libstoreservicescore` library on-device through an ELF loader and generates them itself. Those Apple libraries ride along in the app's assets.
-- **Sign-in.** Normal Apple ID login and the 2-factor code, straight to Apple.
-- **The hard part — validation data.** Apple's registration step needs a signed blob that's normally produced by a real device's `IMDAppleServices` binary. Relay produces it by literally *emulating that binary* on the phone inside a small x86-64 CPU emulator (unicorn), faking out the ~37 CoreFoundation/IOKit calls it makes so it thinks it's running on your Mac's hardware. It's a port of the approach pypush pioneered. This was, by a wide margin, the fussiest thing to get right.
-- **Register.** Your email handles register with Apple and messages turn blue.
+Activation. The app activates against Apple's `albert.apple.com` with a bundled Apple device certificate and gets back a real device cert plus a push token.
 
-### You need a Mac config, once
+Anisette. Apple wants device-attestation headers (`X-Apple-I-MD*`) on its requests. Plenty of clients fetch those from a public anisette server; Relay instead loads Apple's own `libstoreservicescore` library on-device through an ELF loader and produces them itself. Those Apple libraries ship in the app's assets.
 
-That emulation step needs a hardware identity to pretend to be. You generate it one time by running OpenBubbles' "Mac Hardware Info" tool on a Mac you actually own — it spits out a blob with the serial, board id, ROM, and the FairPlay-encrypted device keys. You paste that into Relay during setup and it's stored on the phone. It's not in this repo, and it never goes anywhere except to Apple as part of registering.
+Sign-in. Ordinary Apple ID login plus the 2-factor code, direct to Apple.
 
-One honest limitation: a Mac's identity only lets you register your **email** iMessage handles. Registering your **phone number** to iMessage needs iPhone-class validation data, which you can't get this way — so texts to your number stay green (SMS). Email iMessage works fully.
+Validation data. This was the hard one. Registration needs a signed blob that a genuine device's `IMDAppleServices` binary produces. Relay produces it by emulating that binary on the phone inside a small x86-64 CPU emulator (unicorn), answering the roughly 37 CoreFoundation and IOKit calls it makes so it believes it's running on your Mac's hardware. It's a port of what pypush figured out.
 
-## The rest
+Register. Your email handles register and messages go blue.
 
-Signal connects as a linked device (like linking Signal Desktop), Instagram does DMs, and Relay sets itself as the system SMS/MMS app. Everything lands in one shared inbox with one notifier.
+### The one-time Mac config
+
+The emulation needs a hardware identity to imitate. You make it once by running OpenBubbles' "Mac Hardware Info" tool on a Mac you own; it produces a blob with the serial, board id, ROM, and the FairPlay-encrypted device keys. You paste that into Relay at setup and it stays on the phone. It isn't in this repo, and it only ever goes to Apple as part of registering.
+
+A limit worth knowing: a Mac's identity registers your email iMessage handles only. Your phone number needs iPhone-class validation data, which this approach can't produce, so texts to your number stay green over SMS. Email iMessage is fully there.
+
+## Signal
+
+Relay joins your Signal account as a linked device, the same way Signal Desktop does. You open Signal on your phone, go to Linked Devices, and scan the QR code Relay shows. Under the hood that's a provisioning handshake: Relay generates an ephemeral keypair, your primary phone encrypts the account keys to it, and they pass through Signal's server without the server ever seeing them. Your existing phone stays the primary device and Relay is just a second linked one, so adding it doesn't touch or re-register your number.
+
+From there it speaks the real Signal protocol through Signal's own `libsignal` library, so messages are end-to-end encrypted the normal way. A few details it handles: the linked-device name is encrypted before it's sent, so the server never learns what you named it; the protocol store (identity keys, sessions, sender keys) is persisted so the link survives restarts; and it shows Signal's own Delivered/Read status on messages you send.
+
+## Instagram
+
+Instagram DMs go over Instagram's private mobile API. You log in with your username and password. If Instagram asks for a 2-factor code, or throws a checkpoint because it doesn't recognize the login, Relay walks you through it (sometimes that means approving the login once in the real Instagram app and then retrying). It keeps a stable device fingerprint so Instagram doesn't treat every launch as a brand-new device, and it stores the session encrypted on the phone. You get sending, receiving, and Sent/Seen status on your threads.
 
 ## Getting a build
 
-Every push builds a signed release APK through GitHub Actions. If I push a version tag it also drops the APK onto a GitHub Release:
+Every push builds a signed release APK in GitHub Actions. Push a version tag and it also uploads the APK to a GitHub Release:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-Otherwise the APK is sitting in the workflow run's artifacts. Download `relay-<version>.apk` and sideload it.
+Without a tag, the APK is in the workflow run's artifacts. Grab `relay-<version>.apk` and sideload it.
 
 ## Building it yourself
 
-The app itself is Kotlin + Compose and builds the normal way with Gradle (`./gradlew :app:assembleRelease`, JDK 17). The native iMessage library (`app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so`) is checked in already-compiled, because its Rust source (my fork of rustpush plus the JNI glue) lives outside this repo and needs Apple binaries to build — so CI and a normal Gradle build just package the existing `.so`. And yes, a GitHub-built APK does full on-device iMessage exactly like a local one; it still asks for the Mac config and your Apple ID on first run.
+The app is Kotlin and Compose, built the normal way with Gradle (`./gradlew :app:assembleRelease`, JDK 17). The native iMessage library (`app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so`) is checked in already compiled. Its Rust source (my fork of rustpush plus the JNI glue) lives outside this repo and needs Apple binaries to build, so CI and a plain Gradle build just package the existing `.so`. A CI-built APK does full on-device iMessage just like a local one; it still asks for the Mac config and your Apple ID the first time you run it.
 
-Releases are signed with a checked-in Android debug key (the well-known `android` password), so every build — mine, yours, or CI's — comes out with the same signature and can update over the last one.
+Releases are signed with a checked-in Android debug key (the standard `android` password), so every build (mine, yours, CI's) shares one signature and can update over the last.
 
 ## Credit
 
-The heavy lifting on the iMessage protocol is [OpenBubbles / rustpush](https://github.com/OpenBubbles/rustpush) and the pypush project it descends from. Relay is the Android app and the on-device wiring around them.
+The real work on the iMessage protocol is [OpenBubbles / rustpush](https://github.com/OpenBubbles/rustpush) and the pypush project it grew out of. Relay is the Android app and the on-device wiring around them.
