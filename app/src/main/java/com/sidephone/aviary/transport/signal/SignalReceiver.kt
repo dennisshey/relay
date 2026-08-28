@@ -447,18 +447,27 @@ class SignalReceiver(
             }
         }
 
-        // Mentions (DataMessage.bodyRanges, repeated field 5). Each range: start(1), length(2), and
-        // mentionAci(3) as a string or a 16-byte ServiceId. Signal puts a single U+FFFC placeholder
-        // in the body at each mention; we resolve the ACI to a name and swap the placeholder for
-        // "@Name". A range that @-mentions our own ACI also flags the message so a muted (Secondary)
-        // group still notifies. Returns (start, length, aci) per range.
+        // Mentions (DataMessage.bodyRanges, repeated field 18 — field 5 is expireTimer). Each range:
+        // start(1), length(2), and mentionAci(3) as a string or a 16-byte ServiceId. Signal puts a
+        // single U+FFFC placeholder in the body at each mention; we resolve the ACI to a name and
+        // swap the placeholder for "@Name". A range that @-mentions our own ACI also flags the
+        // message so a muted (Secondary) group still notifies. Returns (start, length, aci) per range.
         val mentionRanges: List<Triple<Int, Int, String>> = dm.asSequence()
-            .filter { it.number == 5 && it.bytes != null }
+            .filter { it.number == 18 && it.bytes != null }
             .mapNotNull { br ->
                 val f = MiniProto.parse(br.bytes!!)
-                val aci = MiniProto.stringField(f, 3)
-                    ?: MiniProto.bytesField(f, 3)?.let { serviceIdToUuid(it) }
-                    ?: return@mapNotNull null
+                // mentionAci: modern Signal encodes it as a 16-byte binary ServiceId at field 5
+                // (mentionAciServiceIdBinary); older senders used a UUID string at field 3. Try the
+                // binary field first, then fall back to the legacy string.
+                val bin = MiniProto.bytesField(f, 5)
+                val str = MiniProto.bytesField(f, 3)
+                val aci = when {
+                    bin != null && bin.size >= 16 -> serviceIdToUuid(bin)
+                    str != null -> str.decodeToString().let { s ->
+                        if (s.length == 36 && s.count { c -> c == '-' } == 4) s else serviceIdToUuid(str)
+                    }
+                    else -> null
+                } ?: return@mapNotNull null
                 val start = (MiniProto.varintField(f, 1) ?: 0L).toInt()
                 val length = (MiniProto.varintField(f, 2) ?: 1L).toInt()
                 Triple(start, length, aci)

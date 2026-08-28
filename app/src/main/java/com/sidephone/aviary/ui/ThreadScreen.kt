@@ -183,6 +183,23 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
             ?.let { it >= messages.size - 2 } ?: true
         if (atBottom) listState.scrollToItem(lastIndex)
     }
+    // Keep the newest message visible when the keyboard opens: adjustResize shrinks the list
+    // viewport, but the list keeps its scroll offset, so the last message slides behind the
+    // composer. When the viewport shrinks while we were at the bottom, stick to the last message.
+    LaunchedEffect(listState) {
+        var prev = 0
+        androidx.compose.runtime.snapshotFlow { listState.layoutInfo.viewportSize.height }
+            .collect { h ->
+                val shrank = prev != 0 && h in 1 until prev
+                prev = h
+                val total = listState.layoutInfo.totalItemsCount
+                if (shrank && total > 0) {
+                    val atBottom = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
+                        ?.let { it >= total - 2 } ?: true
+                    if (atBottom) listState.scrollToItem(total - 1)
+                }
+            }
+    }
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val pickMedia = rememberLauncherForActivityResult(
@@ -196,9 +213,10 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                 data to context.contentResolver.getType(uri)
             }
             if (bytes == null) return@launch
-            app.transports.byId(c.transportId)
-                ?.sendMedia(c, bytes, type, null, draft.trim())
-                ?.onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
+            // Route media the same way as text: iMessage when the number is reachable, else SMS/MMS.
+            app.router.resolve(c)
+                .sendMedia(c, bytes, type, null, draft.trim())
+                .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
             draft = ""
         }
     }
@@ -213,9 +231,9 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                 Triple(data, context.contentResolver.getType(uri), displayName(context, uri))
             }
             if (bytes == null) return@launch
-            app.transports.byId(c.transportId)
-                ?.sendMedia(c, bytes, type, name, draft.trim())
-                ?.onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
+            app.router.resolve(c)
+                .sendMedia(c, bytes, type, name, draft.trim())
+                .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
             draft = ""
         }
     }
@@ -418,9 +436,9 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                 onSendVoice = { bytes ->
                     scope.launch {
                         val c = convo ?: return@launch
-                        app.transports.byId(c.transportId)
-                            ?.sendMedia(c, bytes, "audio/mp4", "voice.m4a", "")
-                            ?.onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send voice message") }
+                        app.router.resolve(c)
+                            .sendMedia(c, bytes, "audio/mp4", "voice.m4a", "")
+                            .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send voice message") }
                     }
                 },
                 onSend = {
@@ -485,14 +503,13 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                                     onClick = {
                                         forwarding = null
                                         scope.launch {
-                                            val transport = app.transports.byId(target.transportId)
                                             if (fwdMsg.mediaPath != null) {
                                                 val bytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                                                     runCatching { java.io.File(fwdMsg.mediaPath).readBytes() }.getOrNull()
                                                 }
-                                                if (bytes != null) transport
-                                                    ?.sendMedia(target, bytes, fwdMsg.mediaType, null, fwdMsg.body)
-                                                    ?.onFailure { snackbar.showSnackbar(it.message ?: "Forward failed") }
+                                                if (bytes != null) app.router.resolve(target)
+                                                    .sendMedia(target, bytes, fwdMsg.mediaType, null, fwdMsg.body)
+                                                    .onFailure { snackbar.showSnackbar(it.message ?: "Forward failed") }
                                             } else {
                                                 app.router.resolve(target).sendText(target, fwdMsg.body)
                                                     .onFailure { snackbar.showSnackbar(it.message ?: "Forward failed") }
@@ -543,6 +560,21 @@ private fun VoiceMessage(path: String, tint: Color) {
         Text("Voice message", color = tint, style = MaterialTheme.typography.bodyMedium)
     }
 }
+
+/** True if the file at [path] starts with a known image magic number (JPEG/PNG/GIF/WEBP/HEIC). */
+private fun isImageFile(path: String): Boolean = runCatching {
+    java.io.File(path).inputStream().use { s ->
+        val b = ByteArray(12)
+        val n = s.read(b)
+        if (n < 4) return false
+        val u = { i: Int -> b[i].toInt() and 0xFF }
+        (u(0) == 0xFF && u(1) == 0xD8) || // JPEG
+            (u(0) == 0x89 && u(1) == 0x50 && u(2) == 0x4E && u(3) == 0x47) || // PNG
+            (u(0) == 0x47 && u(1) == 0x49 && u(2) == 0x46) || // GIF
+            (n >= 12 && u(8) == 0x57 && u(9) == 0x45 && u(10) == 0x42 && u(11) == 0x50) || // WEBP (RIFF....WEBP)
+            (n >= 12 && u(4) == 0x66 && u(5) == 0x74 && u(6) == 0x79 && u(7) == 0x70) // HEIC/ISO-BMFF (ftyp)
+    }
+}.getOrDefault(false)
 
 /** Share an image via the system share sheet (FileProvider uri). */
 private fun shareImage(context: android.content.Context, path: String) {
@@ -717,8 +749,15 @@ private fun MessageBubble(
             !msg.mediaUrl.isNullOrBlank() -> msg.mediaPath
             else -> null
         }
-        val hasThumb = msg.mediaPath != null &&
-            (msg.mediaType?.startsWith("image/") == true || isVideo)
+        // Treat the attachment as an image when the mediaType says so OR — when the transport gave us
+        // no/opaque type (e.g. a Signal pointer with no contentType) — when the file's magic bytes are
+        // an image. Without this, such photos fall through to a plain "Attachment" label with no viewer.
+        val isImage = remember(msg.mediaPath, msg.mediaType) {
+            msg.mediaType?.startsWith("image/") == true ||
+                ((msg.mediaType.isNullOrBlank() || msg.mediaType == "application/octet-stream") &&
+                    msg.mediaPath != null && !isVideo && isImageFile(msg.mediaPath!!))
+        }
+        val hasThumb = msg.mediaPath != null && (isImage || isVideo)
         // Fully rounded within a block; only the last bubble gets the tail corner.
         val bubbleShape = RoundedCornerShape(
             topStart = 18.dp, topEnd = 18.dp,

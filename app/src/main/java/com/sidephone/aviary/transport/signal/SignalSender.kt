@@ -283,13 +283,15 @@ class SignalSender(
         MiniProto.Writer().string(1, body).varint(7, ts)
             .also { if (quote != null) it.bytes(8, quoteProto(quote)) } // DataMessage.quote
             .also { if (groupContext != null) it.bytes(15, groupContext) }
-            // DataMessage.bodyRanges (repeated field 5). Each mention: start(1), length(2) over the
-            // U+FFFC placeholder in body, and mentionAci(3) as the ACI UUID string.
+            // DataMessage.bodyRanges (repeated field 18 — field 5 of DataMessage is expireTimer).
+            // Each mention BodyRange: start(1), length(2) over the U+FFFC placeholder in body, and
+            // the mentionAci as a 16-byte binary ServiceId at field 5 (modern Signal; the legacy
+            // string at field 3 is no longer read by current clients).
             .also { w ->
                 mentions.forEach { (start, len, aci) ->
-                    w.bytes(5, MiniProto.Writer()
-                        .varint(1, start.toLong()).varint(2, len.toLong()).string(3, aci)
-                        .toByteArray())
+                    val br = MiniProto.Writer().varint(1, start.toLong()).varint(2, len.toLong())
+                    aciToBytes(aci)?.let { br.bytes(5, it) }
+                    w.bytes(18, br.toByteArray())
                 }
             }
             .toByteArray()

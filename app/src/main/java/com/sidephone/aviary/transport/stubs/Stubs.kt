@@ -79,13 +79,14 @@ class IMessageTransport(
     /** True if the address (phone or email) is registered on iMessage — routes it blue. */
     override suspend fun canReach(address: String): Boolean {
         if (!initialized || _status.value !is TransportStatus.Ready) return false
-        reachCache[address]?.let { return it }
+        val handle = imessageHandle(address)
+        reachCache[handle]?.let { return it }
         return withContext(Dispatchers.IO) {
             runCatching {
-                val res = json(ImessageNative.nativeCanReach(address))
+                val res = json(ImessageNative.nativeCanReach(handle))
                 val reachable = res.optBoolean("ok") && res.optBoolean("reachable")
                 // Only cache positive/known results; leave transient failures uncached.
-                if (res.optBoolean("ok")) reachCache[address] = reachable
+                if (res.optBoolean("ok")) reachCache[handle] = reachable
                 reachable
             }.getOrDefault(false)
         }
@@ -226,7 +227,7 @@ class IMessageTransport(
                     replyToPreview = replyTo?.let { it.body.ifBlank { null } },
                 )
             )
-            val participants = JSONArray().apply { put(conversation.address) }.toString()
+            val participants = participantsJson(conversation)
             val res = json(ImessageNative.nativeSendText(participants, body, replyGuid ?: "", guid))
             if (res.optBoolean("ok")) {
                 // Only PENDING→SENT: never downgrade a DELIVERED/READ that already raced in.
@@ -241,7 +242,27 @@ class IMessageTransport(
     override val canStartConversations: Boolean get() = false
 
     private fun participantsJson(convo: ConversationEntity) =
-        JSONArray().apply { put(convo.address) }.toString()
+        JSONArray().apply { put(imessageHandle(convo.address)) }.toString()
+
+    /**
+     * Normalize a conversation address to an iMessage IDS handle ("tel:+E164" or "mailto:addr").
+     * SMS-owned threads store a bare number like "3147240320"; iMessage's IDS lookup and send both
+     * need the "tel:+1…" URI form, so the router's reachability check and the actual send only work
+     * once it's normalized. Handles already in URI form pass through unchanged.
+     */
+    private fun imessageHandle(address: String): String {
+        val a = address.trim()
+        if (a.startsWith("mailto:") || a.startsWith("tel:")) return a
+        if (a.contains("@")) return "mailto:$a"
+        val digits = a.filter { it.isDigit() || it == '+' }
+        val e164 = when {
+            digits.startsWith("+") -> digits
+            digits.length == 10 -> "+1$digits"
+            digits.length == 11 && digits.startsWith("1") -> "+$digits"
+            else -> "+$digits"
+        }
+        return "tel:$e164"
+    }
 
     override suspend fun sendReaction(
         conversation: ConversationEntity, message: MessageEntity, emoji: String, add: Boolean,
@@ -345,6 +366,10 @@ class IMessageTransport(
                 repo.setMessageStatus(rowId, MessageStatus.FAILED)
                 Result.failure(Exception(res.optString("error", "send failed")))
             }
+        } catch (e: Throwable) {
+            Log.e(TAG, "sendMedia: threw", e)
+            repo.setMessageStatus(rowId, MessageStatus.FAILED)
+            Result.failure(e)
         } finally {
             tmp.delete()
         }
@@ -405,6 +430,9 @@ class IMessageTransport(
             // Also collapse SMS↔iMessage duplicates for the same number into one thread.
             runCatching { repo.mergePhoneDuplicates() }
                 .onFailure { Log.w(TAG, "merge phone duplicates failed", it) }
+            // And collapse an email-based iMessage thread into the same contact's SMS thread.
+            runCatching { mergeImessageIntoSmsByContact() }
+                .onFailure { Log.w(TAG, "merge iMessage into SMS by contact failed", it) }
             // Repair rows that earlier builds tagged with the literal string "null" (which made
             // every text message show a bogus "Attachment" label).
             runCatching { repo.repairLiteralNulls(id) }
@@ -504,12 +532,43 @@ class IMessageTransport(
         // Key 1:1 chats by the resolved contact so a person reached by both email and phone
         // stays a single thread; fall back to the raw chat id when there's no contact match.
         val convoKey = if (!chat.contains(";") && contactId != null) "imc:$contactId" else chat
+        // When this chat now resolves to a saved contact, fold any pre-existing raw-handle thread
+        // (created before the contact was saved, keyed by "mailto:"/"tel:") into the contact-keyed
+        // thread. Without this, once a contact becomes resolvable, new messages fork into a second
+        // thread while the old one stays behind. The one-shot launch merge races live ingest, so we
+        // reconcile here at message time too.
+        if (contactId != null && !chat.contains(";") && convoKey != chat) {
+            val raw = repo.conversationByExternal(id, chat)
+            if (raw != null) {
+                val existing = repo.conversationByExternal(id, convoKey)
+                if (existing == null) {
+                    Log.i(TAG, "rekey raw thread ${raw.id} ('$chat') -> '$convoKey'")
+                    repo.setConversationExternalId(raw.id, convoKey)
+                } else if (existing.id != raw.id) {
+                    Log.i(TAG, "fold raw thread ${raw.id} ('$chat') into ${existing.id} ('$convoKey')")
+                    repo.mergeConversations(existing.id, raw.id)
+                }
+            }
+        }
         // Prefer this message's NATURAL iMessage thread if it already exists; only when it doesn't
         // yet do we fold into an existing SMS thread for the same number (the "SMS thread converts
         // to iMessage" case). This avoids diverting an active iMessage thread onto a stray SMS one.
         val natural = repo.conversationByExternal(id, convoKey)
-        val folded = if (natural == null && !chat.contains(";") && address.startsWith("tel:"))
-            repo.conversationForPhone(cleanHandle(address))?.takeIf { it.transportId != id } else null
+        // Fold this iMessage into an existing SMS thread for the same person so we keep ONE thread.
+        // A phone-handle iMessage matches by its own number; an EMAIL-handle iMessage (which has no
+        // number to match) folds via the resolved contact's phone numbers. Survivor is the SMS
+        // thread, matching how the app already unifies same-number SMS/iMessage.
+        val folded = if (natural == null && !chat.contains(";")) {
+            when {
+                address.startsWith("tel:") ->
+                    repo.conversationForPhone(cleanHandle(address))?.takeIf { it.transportId != id }
+                contactId != null ->
+                    contactPhones(contactId).firstNotNullOfOrNull { ph ->
+                        repo.conversationForPhone(ph)?.takeIf { it.transportId != id }
+                    }
+                else -> null
+            }
+        } else null
         val convo = natural ?: folded ?: repo.upsertConversation(
             transportId = id,
             externalId = convoKey,
@@ -663,6 +722,39 @@ class IMessageTransport(
             } else null
             Triple(name, photo, if (contactId >= 0) contactId else null)
         }.getOrDefault(Triple(null, null, null))
+    }
+
+    /** All phone numbers on the given Android contact (used to fold an email-iMessage thread into
+     *  the same person's SMS thread). Empty if contacts aren't readable. */
+    private fun contactPhones(contactId: Long): List<String> {
+        if (context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return emptyList()
+        return runCatching {
+            val out = mutableListOf<String>()
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                "${ContactsContract.CommonDataKinds.Phone.CONTACT_ID} = ?",
+                arrayOf(contactId.toString()), null,
+            )?.use { c -> while (c.moveToNext()) c.getString(0)?.let { out.add(it) } }
+            out
+        }.getOrDefault(emptyList())
+    }
+
+    /** Collapse an iMessage 1:1 thread into the SAME contact's SMS thread (e.g. an email-based
+     *  iMessage that couldn't fold by number). Runs at startup as one-time cleanup for threads that
+     *  forked before the contact-aware fold existed. */
+    private suspend fun mergeImessageIntoSmsByContact() {
+        for (c in repo.conversationsForTransport(id)) {
+            if (c.externalId.contains(";")) continue // skip group chats
+            val cid = resolveContact(c.address).third ?: continue
+            val sms = contactPhones(cid).firstNotNullOfOrNull { ph ->
+                repo.conversationForPhone(ph)?.takeIf { it.transportId == "sms" }
+            } ?: continue
+            Log.i(TAG, "cross-merge iMessage convo ${c.id} ('${c.externalId}') into SMS ${sms.id}")
+            repo.mergeConversations(sms.id, c.id)
+        }
     }
 
     /**
