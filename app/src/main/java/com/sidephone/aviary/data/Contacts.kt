@@ -42,4 +42,34 @@ object Contacts {
         }
         return out
     }
+
+    /** Contacts that have an email address (the address is carried in [DeviceContact.number]),
+     *  one row per distinct email. Used to start an iMessage thread to an email handle. */
+    fun emails(context: Context): List<DeviceContact> {
+        if (!hasPermission(context)) return emptyList()
+        val proj = arrayOf(
+            ContactsContract.CommonDataKinds.Email.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Email.ADDRESS,
+            ContactsContract.CommonDataKinds.Email.PHOTO_THUMBNAIL_URI,
+        )
+        val seen = HashSet<String>()
+        val out = ArrayList<DeviceContact>()
+        runCatching {
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Email.CONTENT_URI, proj, null, null,
+                "${ContactsContract.CommonDataKinds.Email.DISPLAY_NAME} COLLATE NOCASE ASC",
+            )?.use { c ->
+                val iName = c.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Email.DISPLAY_NAME)
+                val iAddr = c.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Email.ADDRESS)
+                val iPhoto = c.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Email.PHOTO_THUMBNAIL_URI)
+                while (c.moveToNext()) {
+                    val name = c.getString(iName) ?: continue
+                    val email = c.getString(iAddr)?.trim() ?: continue
+                    if (email.isBlank() || !seen.add(email.lowercase())) continue
+                    out.add(DeviceContact(name, email, c.getString(iPhoto)))
+                }
+            }
+        }
+        return out
+    }
 }

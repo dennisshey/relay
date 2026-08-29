@@ -112,7 +112,14 @@ fun NewMessageScreen(app: RelayApp, onOpenThread: (Long) -> Unit, onBack: () -> 
             Spacer(Modifier.size(8.dp))
 
             when (network) {
-                NewChatNetwork.MESSAGES -> MessagesPicker(app, context, query, busy) { run { app.smsTransport.startConversation(it) } }
+                NewChatNetwork.MESSAGES -> MessagesPicker(app, context, query, busy) { addr ->
+                    // An email routes to iMessage (blue); a phone number starts an SMS thread that
+                    // the router upgrades to iMessage when the number is reachable.
+                    run {
+                        if (addr.contains("@")) app.imessageTransport.startConversation(addr)
+                        else app.smsTransport.startConversation(addr)
+                    }
+                }
                 NewChatNetwork.SIGNAL -> SignalPicker(app, query, busy, onOpenThread,
                     onStartNew = { run { app.signalTransport.startConversation(it) } },
                     onStartAci = { aci, name -> run { app.signalTransport.startWithAci(aci, name) } })
@@ -133,6 +140,9 @@ private fun MessagesPicker(
     val contacts by produceState(emptyList<DeviceContact>(), hasContacts) {
         value = if (hasContacts) withContext(Dispatchers.IO) { Contacts.all(context) } else emptyList()
     }
+    val emails by produceState(emptyList<DeviceContact>(), hasContacts) {
+        value = if (hasContacts) withContext(Dispatchers.IO) { Contacts.emails(context) } else emptyList()
+    }
     val filtered = remember(contacts, query) {
         val q = query.trim()
         if (q.isBlank()) contacts else {
@@ -140,13 +150,25 @@ private fun MessagesPicker(
             contacts.filter { it.name.contains(q, true) || (d.length >= 3 && it.number.filter { c -> c.isDigit() }.contains(d)) }
         }
     }
+    val filteredEmails = remember(emails, query) {
+        val q = query.trim()
+        if (q.isBlank()) emails else emails.filter { it.name.contains(q, true) || it.number.contains(q, true) }
+    }
     val looksLikeNumber = query.isNotBlank() && query.any { it.isDigit() } && query.all { it.isDigit() || it in "+-() ." }
+    val looksLikeEmail = query.trim().let { it.contains("@") && it.substringAfter("@").contains(".") }
     if (!hasContacts) TextButton(onClick = { permLauncher.launch(android.Manifest.permission.READ_CONTACTS) }) {
         Text("Allow contacts to search people")
     }
     LazyColumn(Modifier.fillMaxSize()) {
         if (looksLikeNumber) item("raw") { ContactRow("Message ${query.trim()}", null, !busy) { onStart(query) }; Divider() }
-        items(filtered, key = { it.name + "|" + it.number }) { c -> ContactRow(c.name, c.number, !busy) { onStart(c.number) }; Divider() }
+        if (looksLikeEmail) item("rawEmail") {
+            ContactRow("iMessage ${query.trim()}", null, !busy) { onStart(query.trim()) }; Divider()
+        }
+        items(filtered, key = { "n|" + it.name + "|" + it.number }) { c -> ContactRow(c.name, c.number, !busy) { onStart(c.number) }; Divider() }
+        // Contact email addresses, shown as iMessage targets (blue).
+        items(filteredEmails, key = { "e|" + it.name + "|" + it.number }) { c ->
+            ContactRow(c.name, "${c.number} · iMessage", !busy) { onStart(c.number) }; Divider()
+        }
     }
 }
 

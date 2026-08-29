@@ -234,12 +234,35 @@ class IMessageTransport(
                 repo.upgradeFromPending(rowId, MessageStatus.SENT)
                 Result.success(Unit)
             } else {
-                repo.setMessageStatus(rowId, MessageStatus.FAILED)
-                Result.failure(Exception(res.optString("error", "send failed")))
+                smsFallback(conversation, rowId, guid)
+                    ?.sendText(conversation, body, replyTo)
+                    ?: run {
+                        repo.setMessageStatus(rowId, MessageStatus.FAILED)
+                        Result.failure(Exception(res.optString("error", "send failed")))
+                    }
             }
         }
 
     override val canStartConversations: Boolean get() = false
+
+    /**
+     * Start (or reopen) a 1:1 iMessage thread addressed to an email (or any handle). Used by the
+     * new-message picker so you can iMessage someone whose number isn't on iMessage — e.g. a contact
+     * who moved to Android but still has iMessage on their email. Fails if the handle isn't
+     * reachable on iMessage, since there's no SMS fallback for an email.
+     */
+    override suspend fun startConversation(address: String): Result<Long> = withContext(Dispatchers.IO) {
+        runCatching {
+            val handle = imessageHandle(address)
+            if (!canReach(handle)) error("${cleanHandle(address)} isn't reachable on iMessage")
+            val (name, _, contactId) = resolveContact(handle)
+            val key = if (contactId != null) "imc:$contactId" else handle
+            repo.upsertConversation(
+                transportId = id, externalId = key, address = handle,
+                title = name ?: cleanHandle(address), category = InboxCategory.PRIMARY,
+            ).id
+        }
+    }
 
     private fun participantsJson(convo: ConversationEntity) =
         JSONArray().apply { put(imessageHandle(convo.address)) }.toString()
@@ -262,6 +285,26 @@ class IMessageTransport(
             else -> "+$digits"
         }
         return "tel:$e164"
+    }
+
+    /**
+     * When an iMessage send fails on a phone-number (SMS-owned) thread, the recipient may have left
+     * iMessage (e.g. switched to Android). Drop the stale "reachable" cache so the router re-checks
+     * capability, and if this thread can fall back to SMS, remove the failed blue bubble and return
+     * the SMS transport for the caller to resend green. Returns null when there's no SMS fallback,
+     * in which case the caller should mark the message FAILED.
+     */
+    private suspend fun smsFallback(
+        conversation: ConversationEntity, rowId: Long, guid: String,
+    ): MessageTransport? {
+        // Mark unreachable so the router sends SMS directly next time instead of retrying a failing
+        // iMessage on every message. Cleared on restart, which re-checks capability with Apple.
+        reachCache[imessageHandle(conversation.address)] = false
+        if (conversation.transportId != com.sidephone.aviary.transport.sms.SmsTransport.ID) return null
+        val sms = (context as? com.sidephone.aviary.RelayApp)?.smsTransport ?: return null
+        repo.deleteMessage(rowId)
+        seenGuids.remove(guid)
+        return sms
     }
 
     override suspend fun sendReaction(
@@ -363,8 +406,12 @@ class IMessageTransport(
                 repo.upgradeFromPending(rowId, MessageStatus.SENT)
                 Result.success(Unit)
             } else {
-                repo.setMessageStatus(rowId, MessageStatus.FAILED)
-                Result.failure(Exception(res.optString("error", "send failed")))
+                smsFallback(conversation, rowId, guid)
+                    ?.sendMedia(conversation, media, contentType, fileName, caption)
+                    ?: run {
+                        repo.setMessageStatus(rowId, MessageStatus.FAILED)
+                        Result.failure(Exception(res.optString("error", "send failed")))
+                    }
             }
         } catch (e: Throwable) {
             Log.e(TAG, "sendMedia: threw", e)
@@ -430,9 +477,6 @@ class IMessageTransport(
             // Also collapse SMS↔iMessage duplicates for the same number into one thread.
             runCatching { repo.mergePhoneDuplicates() }
                 .onFailure { Log.w(TAG, "merge phone duplicates failed", it) }
-            // And collapse an email-based iMessage thread into the same contact's SMS thread.
-            runCatching { mergeImessageIntoSmsByContact() }
-                .onFailure { Log.w(TAG, "merge iMessage into SMS by contact failed", it) }
             // Repair rows that earlier builds tagged with the literal string "null" (which made
             // every text message show a bogus "Attachment" label).
             runCatching { repo.repairLiteralNulls(id) }
@@ -564,7 +608,12 @@ class IMessageTransport(
                     repo.conversationForPhone(cleanHandle(address))?.takeIf { it.transportId != id }
                 contactId != null ->
                     contactPhones(contactId).firstNotNullOfOrNull { ph ->
-                        repo.conversationForPhone(ph)?.takeIf { it.transportId != id }
+                        val sms = repo.conversationForPhone(ph)?.takeIf { it.transportId != id }
+                        // Fold an email-based iMessage into the phone thread ONLY when that number is
+                        // itself iMessage-capable (same blue channel, one person one thread). If the
+                        // number is SMS-only — e.g. the contact moved to Android — the email iMessage
+                        // is a genuinely different channel and keeps its own thread.
+                        if (sms != null && canReach(ph)) sms else null
                     }
                 else -> null
             }
@@ -740,21 +789,6 @@ class IMessageTransport(
             )?.use { c -> while (c.moveToNext()) c.getString(0)?.let { out.add(it) } }
             out
         }.getOrDefault(emptyList())
-    }
-
-    /** Collapse an iMessage 1:1 thread into the SAME contact's SMS thread (e.g. an email-based
-     *  iMessage that couldn't fold by number). Runs at startup as one-time cleanup for threads that
-     *  forked before the contact-aware fold existed. */
-    private suspend fun mergeImessageIntoSmsByContact() {
-        for (c in repo.conversationsForTransport(id)) {
-            if (c.externalId.contains(";")) continue // skip group chats
-            val cid = resolveContact(c.address).third ?: continue
-            val sms = contactPhones(cid).firstNotNullOfOrNull { ph ->
-                repo.conversationForPhone(ph)?.takeIf { it.transportId == "sms" }
-            } ?: continue
-            Log.i(TAG, "cross-merge iMessage convo ${c.id} ('${c.externalId}') into SMS ${sms.id}")
-            repo.mergeConversations(sms.id, c.id)
-        }
     }
 
     /**
