@@ -35,6 +35,7 @@ class SmsTransport(
     private val context: Context,
     private val repo: UnifiedRepository,
     private val mediaStore: com.sidephone.aviary.data.MediaStore,
+    private val avatarStore: com.sidephone.aviary.data.AvatarStore,
 ) : MessageTransport {
 
     override val id = ID
@@ -65,7 +66,18 @@ class SmsTransport(
             return
         }
         syncFromTelephony()
+        runCatching { backfillContactPhotos() }
         _status.value = TransportStatus.Ready
+    }
+
+    /** Pull Android contact photos for existing SMS threads that don't have one cached yet, so
+     *  threads created before photo sync existed also show the contact's picture. */
+    private suspend fun backfillContactPhotos() = withContext(Dispatchers.IO) {
+        for (c in repo.conversationsForTransport(ID)) {
+            if (avatarStore.has(c.externalId)) continue
+            val photo = lookupContact(c.address).second ?: continue
+            avatarStore.save(c.externalId, photo)
+        }
     }
 
     /** Import existing SMS threads from the system Telephony provider into the unified store. */
@@ -116,8 +128,8 @@ class SmsTransport(
     }
 
     private suspend fun upsertSmsConversation(threadId: String, address: String): ConversationEntity {
-        val contactName = lookupContactName(address)
-        return repo.upsertConversation(
+        val (contactName, photo) = lookupContact(address)
+        val convo = repo.upsertConversation(
             transportId = ID,
             externalId = threadId,
             address = address,
@@ -125,6 +137,10 @@ class SmsTransport(
             // Sunbird-style priority inbox: known contacts land in Primary
             category = if (contactName != null) InboxCategory.PRIMARY else InboxCategory.SECONDARY,
         )
+        // Sync the Android contact photo into the avatar store (keyed by conversation externalId,
+        // the way the inbox looks it up) so SMS threads show contact photos like iMessage does.
+        if (photo != null && !avatarStore.has(convo.externalId)) avatarStore.save(convo.externalId, photo)
+        return convo
     }
 
     override suspend fun sendText(
@@ -383,23 +399,43 @@ class SmsTransport(
         // SMS/MMS threads are direct person-to-person, so they notify even in Secondary
         // (the "direct threads in Secondary still notify" rule); only muted-group chats stay quiet.
         com.sidephone.aviary.data.Notifier.post(
-            context, convo.id, sender = convo.title, body = body, avatarPath = null,
+            context, convo.id, sender = convo.title, body = body,
+            avatarPath = avatarStore.path(convo.externalId),
             muted = convo.muted,
         )
     }
 
-    private fun lookupContactName(address: String): String? {
+    private fun lookupContactName(address: String): String? = lookupContact(address).first
+
+    /** Resolve an SMS address to its Android contact name and photo (JPEG bytes), or nulls. */
+    private fun lookupContact(address: String): Pair<String?, ByteArray?> {
         if (context.checkSelfPermission(Manifest.permission.READ_CONTACTS)
             != PackageManager.PERMISSION_GRANTED
-        ) return null
+        ) return null to null
         val uri = Uri.withAppendedPath(
             ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(address)
         )
         return runCatching {
             context.contentResolver.query(
-                uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null
-            )?.use { if (it.moveToFirst()) it.getString(0) else null }
-        }.getOrNull()
+                uri,
+                arrayOf(
+                    ContactsContract.PhoneLookup.DISPLAY_NAME,
+                    ContactsContract.PhoneLookup.PHOTO_URI,
+                    ContactsContract.PhoneLookup.PHOTO_THUMBNAIL_URI,
+                ),
+                null, null, null,
+            )?.use { c ->
+                if (!c.moveToFirst()) return@use null to null
+                val name = c.getString(0)
+                val photoUri = c.getString(1) ?: c.getString(2)
+                val photo = photoUri?.let { u ->
+                    runCatching {
+                        context.contentResolver.openInputStream(Uri.parse(u))?.use { it.readBytes() }
+                    }.getOrNull()
+                }
+                name to photo
+            } ?: (null to null)
+        }.getOrDefault(null to null)
     }
 
     companion object {

@@ -57,7 +57,7 @@ class RelayApp : Application(), coil.ImageLoaderFactory {
         com.sidephone.aviary.data.MediaStore(this)
     }
 
-    val smsTransport: SmsTransport by lazy { SmsTransport(this, repository, mediaStore) }
+    val smsTransport: SmsTransport by lazy { SmsTransport(this, repository, mediaStore, avatarStore) }
     val signalTransport: SignalTransport by lazy {
         SignalTransport(this, repository, appScope, contactNames, avatarStore, mediaStore)
     }
