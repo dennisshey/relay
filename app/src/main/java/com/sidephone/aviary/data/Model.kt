@@ -120,6 +120,9 @@ interface ConversationDao {
     @Query("UPDATE conversations SET title = :title WHERE id = :id")
     suspend fun setTitle(id: Long, title: String)
 
+    @Query("UPDATE conversations SET address = :address WHERE id = :id")
+    suspend fun setAddress(id: Long, address: String)
+
     @Query("UPDATE conversations SET unreadCount = 0 WHERE id = :id")
     suspend fun markRead(id: Long)
 

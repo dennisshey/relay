@@ -264,8 +264,41 @@ class IMessageTransport(
         }
     }
 
-    private fun participantsJson(convo: ConversationEntity) =
-        JSONArray().apply { put(imessageHandle(convo.address)) }.toString()
+    /** Our own registered iMessage handles (emails), lowercased without scheme — so we can drop
+     *  ourselves from a group's recipient list and member-name title. */
+    private val selfHandles: Set<String> by lazy {
+        runCatching {
+            val arr = json(ImessageNative.nativeHandles()).optJSONArray("handles")
+            buildSet {
+                if (arr != null) for (i in 0 until arr.length()) add(cleanHandle(arr.getString(i)).lowercase())
+            }
+        }.getOrDefault(emptySet())
+    }
+
+    /** Recipient list for a send. A group thread (externalId is a ";"-joined participant list) sends
+     *  to every member except us; a 1:1 sends to the single handle. rustpush keys the group by its
+     *  participant set, so addressing all members continues the same iMessage group. */
+    private fun participantsJson(convo: ConversationEntity): String {
+        val handles = if (convo.externalId.contains(";")) {
+            convo.externalId.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+                .map { imessageHandle(it) }
+                .filterNot { cleanHandle(it).lowercase() in selfHandles }
+                .ifEmpty { convo.externalId.split(";").filter { it.isNotBlank() }.map { imessageHandle(it.trim()) } }
+        } else listOf(imessageHandle(convo.address))
+        return JSONArray().apply { handles.distinct().forEach { put(it) } }.toString()
+    }
+
+    /** A group's display title from its members' names (we're excluded), e.g. "Alice, Bob +2". */
+    private fun groupTitleFor(chat: String): String {
+        val members = chat.split(";").map { it.trim() }
+            .filter { it.isNotEmpty() && cleanHandle(it).lowercase() !in selfHandles }
+        val names = members.map { resolveContact(it).first ?: cleanHandle(it) }
+        return when {
+            names.isEmpty() -> "Group"
+            names.size <= 3 -> names.joinToString(", ")
+            else -> names.take(2).joinToString(", ") + " +${names.size - 2}"
+        }
+    }
 
     /**
      * Normalize a conversation address to an iMessage IDS handle ("tel:+E164" or "mailto:addr").
@@ -622,16 +655,25 @@ class IMessageTransport(
                 else -> null
             }
         } else null
+        // A group thread is titled + addressed by its whole participant list, not the last sender.
+        val isGroupChat = chat.contains(";")
+        val convoTitle = if (isGroupChat) groupTitleFor(chat) else desiredTitle
+        val convoAddress = if (isGroupChat) chat else address
         val convo = natural ?: folded ?: repo.upsertConversation(
             transportId = id,
             externalId = convoKey,
-            address = address,
-            title = desiredTitle,
+            address = convoAddress,
+            title = convoTitle,
             category = InboxCategory.PRIMARY,
         )
-        // Reconcile the title (upgrades old "mailto:" titles and resolves the name), but don't
-        // clobber a good SMS-thread title we've folded into.
-        if (folded == null && convo.title != desiredTitle) repo.setConversationTitle(convo.id, desiredTitle)
+        // Reconcile the title (upgrades old "mailto:" titles / repairs a group mis-titled after a
+        // sender), but don't clobber a good SMS-thread title we've folded into.
+        if (isGroupChat) {
+            if (convo.title != convoTitle) repo.setConversationTitle(convo.id, convoTitle)
+            if (convo.address != chat) repo.setConversationAddress(convo.id, chat)
+        } else if (folded == null && convo.title != desiredTitle) {
+            repo.setConversationTitle(convo.id, desiredTitle)
+        }
         val avatarKey = convo.externalId
         if (photo != null && !avatarStore.has(avatarKey)) avatarStore.save(avatarKey, photo)
         val replyTo = msg.optStringOrNull("reply_to")
@@ -819,7 +861,15 @@ class IMessageTransport(
      *  was created, and cache the contact photo. Group chats keep their participant-list key. */
     private suspend fun refreshContacts() = withContext(Dispatchers.IO) {
         for (c in repo.conversationsForTransport(id)) {
-            if (c.externalId.contains(";")) continue // group chat
+            if (c.externalId.contains(";")) {
+                // Group thread: repair a title/address left pointing at a single sender by older
+                // builds, and refresh member names as contacts are saved. The member list lives in
+                // the externalId, so we can fix it without waiting for the next message.
+                val title = groupTitleFor(c.externalId)
+                if (c.title != title) repo.setConversationTitle(c.id, title)
+                if (c.address != c.externalId) repo.setConversationAddress(c.id, c.externalId)
+                continue
+            }
             val (name, photo, _) = resolveContact(c.address)
             if (name != null && name != c.title) repo.setConversationTitle(c.id, name)
             if (photo != null && !avatarStore.has(c.externalId)) avatarStore.save(c.externalId, photo)

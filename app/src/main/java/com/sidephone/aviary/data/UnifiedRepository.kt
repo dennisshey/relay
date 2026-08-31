@@ -62,6 +62,9 @@ class UnifiedRepository(private val db: AviaryDatabase) {
     suspend fun setConversationTitle(id: Long, title: String) =
         db.conversations().setTitle(id, title)
 
+    suspend fun setConversationAddress(id: Long, address: String) =
+        db.conversations().setAddress(id, address)
+
     suspend fun conversationByExternal(transportId: String, externalId: String): ConversationEntity? =
         db.conversations().byExternal(transportId, externalId)
 
