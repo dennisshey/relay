@@ -361,7 +361,10 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                             showReceipt = msg.id == lastReceiptId,
                             lastInBlock = lastInBlock,
                             senderLabel = if (isGroup && !msg.outgoing && newBlock)
-                                (app.contactNames.get(msg.sender) ?: "Signal member") else null,
+                                (app.contactNames.get(msg.sender)
+                                    ?: if (msg.transportId == "signal") "Signal member"
+                                    else msg.sender.removePrefix("tel:").removePrefix("mailto:"))
+                                else null,
                             // Tap a group member's name to start a 1:1 with them.
                             onSenderClick = if (isGroup && !msg.outgoing && msg.transportId == "signal") {
                                 {

@@ -16,8 +16,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.Alignment
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -112,14 +117,18 @@ fun NewMessageScreen(app: RelayApp, onOpenThread: (Long) -> Unit, onBack: () -> 
             Spacer(Modifier.size(8.dp))
 
             when (network) {
-                NewChatNetwork.MESSAGES -> MessagesPicker(app, context, query, busy) { addr ->
-                    // An email routes to iMessage (blue); a phone number starts an SMS thread that
-                    // the router upgrades to iMessage when the number is reachable.
-                    run {
-                        if (addr.contains("@")) app.imessageTransport.startConversation(addr)
-                        else app.smsTransport.startConversation(addr)
-                    }
-                }
+                NewChatNetwork.MESSAGES -> MessagesPicker(
+                    app, context, query, busy,
+                    onStart = { addr ->
+                        // An email routes to iMessage (blue); a phone number starts an SMS thread
+                        // that the router upgrades to iMessage when the number is reachable.
+                        run {
+                            if (addr.contains("@")) app.imessageTransport.startConversation(addr)
+                            else app.smsTransport.startConversation(addr)
+                        }
+                    },
+                    onStartGroup = { numbers -> run { app.smsTransport.startGroup(numbers) } },
+                )
                 NewChatNetwork.SIGNAL -> SignalPicker(app, query, busy, onOpenThread,
                     onStartNew = { run { app.signalTransport.startConversation(it) } },
                     onStartAci = { aci, name -> run { app.signalTransport.startWithAci(aci, name) } })
@@ -133,7 +142,8 @@ fun NewMessageScreen(app: RelayApp, onOpenThread: (Long) -> Unit, onBack: () -> 
 
 @Composable
 private fun MessagesPicker(
-    app: RelayApp, context: android.content.Context, query: String, busy: Boolean, onStart: (String) -> Unit,
+    app: RelayApp, context: android.content.Context, query: String, busy: Boolean,
+    onStart: (String) -> Unit, onStartGroup: (List<String>) -> Unit,
 ) {
     var hasContacts by remember { mutableStateOf(Contacts.hasPermission(context)) }
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasContacts = it }
@@ -156,18 +166,56 @@ private fun MessagesPicker(
     }
     val looksLikeNumber = query.isNotBlank() && query.any { it.isDigit() } && query.all { it.isDigit() || it in "+-() ." }
     val looksLikeEmail = query.trim().let { it.contains("@") && it.substringAfter("@").contains(".") }
+
+    // Group-compose mode: tapping people accumulates them instead of opening a 1:1.
+    var groupMode by remember { mutableStateOf(false) }
+    val selected = remember { mutableStateListOf<DeviceContact>() }
+    fun toggle(c: DeviceContact) {
+        val i = selected.indexOfFirst { it.number.filter(Char::isDigit).takeLast(10) == c.number.filter(Char::isDigit).takeLast(10) }
+        if (i >= 0) selected.removeAt(i) else selected.add(c)
+    }
+
     if (!hasContacts) TextButton(onClick = { permLauncher.launch(android.Manifest.permission.READ_CONTACTS) }) {
         Text("Allow contacts to search people")
     }
-    LazyColumn(Modifier.fillMaxSize()) {
-        if (looksLikeNumber) item("raw") { ContactRow("Message ${query.trim()}", null, !busy) { onStart(query) }; Divider() }
-        if (looksLikeEmail) item("rawEmail") {
-            ContactRow("iMessage ${query.trim()}", null, !busy) { onStart(query.trim()) }; Divider()
+    Column(Modifier.fillMaxSize()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            FilterChip(
+                selected = groupMode,
+                onClick = { groupMode = !groupMode; if (!groupMode) selected.clear() },
+                label = { Text("New group") },
+            )
+            if (groupMode && selected.size >= 2) {
+                Spacer(Modifier.weight(1f))
+                Button(onClick = { onStartGroup(selected.map { it.number }) }, enabled = !busy) {
+                    Text("Start group (${selected.size})")
+                }
+            }
         }
-        items(filtered, key = { "n|" + it.name + "|" + it.number }) { c -> ContactRow(c.name, c.number, !busy) { onStart(c.number) }; Divider() }
-        // Contact email addresses, shown as iMessage targets (blue).
-        items(filteredEmails, key = { "e|" + it.name + "|" + it.number }) { c ->
-            ContactRow(c.name, "${c.number} · iMessage", !busy) { onStart(c.number) }; Divider()
+        if (groupMode && selected.isNotEmpty()) {
+            Text(
+                selected.joinToString(", ") { it.name },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+        }
+        LazyColumn(Modifier.fillMaxSize()) {
+            if (!groupMode && looksLikeNumber) item("raw") { ContactRow("Message ${query.trim()}", null, !busy) { onStart(query) }; Divider() }
+            if (!groupMode && looksLikeEmail) item("rawEmail") {
+                ContactRow("iMessage ${query.trim()}", null, !busy) { onStart(query.trim()) }; Divider()
+            }
+            items(filtered, key = { "n|" + it.name + "|" + it.number }) { c ->
+                val picked = groupMode && selected.any { it.number.filter(Char::isDigit).takeLast(10) == c.number.filter(Char::isDigit).takeLast(10) }
+                ContactRow(c.name, c.number, !busy, checked = if (groupMode) picked else null) {
+                    if (groupMode) toggle(c) else onStart(c.number)
+                }
+                Divider()
+            }
+            // Email addresses only make sense for a 1:1 iMessage, not group MMS.
+            if (!groupMode) items(filteredEmails, key = { "e|" + it.name + "|" + it.number }) { c ->
+                ContactRow(c.name, "${c.number} · iMessage", !busy) { onStart(c.number) }; Divider()
+            }
         }
     }
 }
@@ -226,8 +274,18 @@ private fun InstagramPicker(app: RelayApp, query: String, busy: Boolean, onPick:
 private fun Divider() = HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
 
 @Composable
-private fun ContactRow(title: String, subtitle: String?, enabled: Boolean, onClick: () -> Unit) {
-    Box(Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onClick).padding(vertical = 12.dp)) {
+private fun ContactRow(
+    title: String, subtitle: String?, enabled: Boolean,
+    checked: Boolean? = null, onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onClick).padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (checked != null) {
+            Checkbox(checked = checked, onCheckedChange = { onClick() }, enabled = enabled)
+            Spacer(Modifier.size(8.dp))
+        }
         Column {
             Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             if (subtitle != null) Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)

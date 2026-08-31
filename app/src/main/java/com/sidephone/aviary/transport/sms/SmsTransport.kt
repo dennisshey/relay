@@ -72,9 +72,122 @@ class SmsTransport(
             return
         }
         syncFromTelephony()
+        runCatching { importMmsThreads() }
         runCatching { syncContacts() }
         registerContactsObserver()
         _status.value = TransportStatus.Ready
+    }
+
+    /** Import existing MMS from the system provider — including group MMS, which the SMS-table
+     *  import misses entirely — so group threads that predate the app show up. Each MMS's recipient
+     *  set comes from its addr sub-table; a set of 3+ becomes a group thread. */
+    private suspend fun importMmsThreads() = withContext(Dispatchers.IO) {
+        val known = repo.knownExternalIds(ID)
+        val cursor = context.contentResolver.query(
+            Telephony.Mms.CONTENT_URI,
+            arrayOf(Telephony.Mms._ID, Telephony.Mms.DATE, Telephony.Mms.MESSAGE_BOX, Telephony.Mms.SUBJECT),
+            null, null, "${Telephony.Mms.DATE} ASC",
+        ) ?: return@withContext
+        cursor.use { c ->
+            val iId = c.getColumnIndexOrThrow(Telephony.Mms._ID)
+            val iDate = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
+            val iBox = c.getColumnIndexOrThrow(Telephony.Mms.MESSAGE_BOX)
+            while (c.moveToNext()) {
+                val mmsId = c.getLong(iId)
+                val extId = "mms:$mmsId"
+                if (extId in known) continue
+                val outgoing = c.getInt(iBox) == Telephony.Mms.MESSAGE_BOX_SENT
+                val dateMs = c.getLong(iDate) * 1000L // MMS date is in seconds
+                val addrs = mmsAddresses(mmsId) // sender + recipients (excludes null/blank)
+                val sender = mmsSender(mmsId) ?: addrs.firstOrNull() ?: continue
+                val participants = addrs.distinctBy { numKey(it) }
+                val convo = if (participants.count { numKey(it).length >= 7 } >= 3)
+                    upsertGroupMms(participants)
+                else {
+                    // 1:1: key by the OTHER party (for an outgoing MMS the sender is us).
+                    val self = selfNumbers()
+                    val partner = participants.firstOrNull { numKey(it) !in self }
+                        ?: if (outgoing) addrs.firstOrNull { numKey(it) != numKey(sender) } ?: sender else sender
+                    upsertSmsConversation(
+                        Telephony.Threads.getOrCreateThreadId(context, partner).toString(), partner,
+                    )
+                }
+                val (text, image) = mmsBody(mmsId)
+                val mediaPath = image?.let { (mime, bytes) -> mediaStore.save(bytes, mime) }
+                repo.recordMessage(
+                    MessageEntity(
+                        conversationId = convo.id, transportId = ID, externalId = extId,
+                        sender = if (outgoing) "me" else sender,
+                        body = text.ifBlank { if (mediaPath != null) "" else "📎 MMS" },
+                        timestamp = dateMs, outgoing = outgoing,
+                        status = if (outgoing) MessageStatus.SENT else MessageStatus.RECEIVED,
+                        mediaPath = mediaPath, mediaType = image?.first,
+                    ),
+                    countUnread = false,
+                )
+            }
+        }
+    }
+
+    /** All addresses (sender + recipients) on a stored MMS, from its addr sub-table. */
+    private fun mmsAddresses(mmsId: Long): List<String> {
+        val out = mutableListOf<String>()
+        runCatching {
+            context.contentResolver.query(
+                Uri.parse("content://mms/$mmsId/addr"),
+                arrayOf("address", "type"), null, null, null,
+            )?.use { a ->
+                val iAddr = a.getColumnIndexOrThrow("address")
+                while (a.moveToNext()) {
+                    val addr = a.getString(iAddr)?.trim() ?: continue
+                    if (addr.isNotEmpty() && !addr.equals("insert-address-token", true)) out += addr
+                }
+            }
+        }
+        return out
+    }
+
+    /** The FROM address (type 137) of a stored MMS. */
+    private fun mmsSender(mmsId: Long): String? = runCatching {
+        context.contentResolver.query(
+            Uri.parse("content://mms/$mmsId/addr"),
+            arrayOf("address", "type"), "type=137", null, null,
+        )?.use { a ->
+            val iAddr = a.getColumnIndexOrThrow("address")
+            if (a.moveToFirst()) a.getString(iAddr)?.trim()?.takeIf { it.isNotEmpty() } else null
+        }
+    }.getOrNull()
+
+    /** Text and (first) image part of a stored MMS, read from its part sub-table. */
+    private fun mmsBody(mmsId: Long): Pair<String, Pair<String, ByteArray>?> {
+        var text = ""
+        var image: Pair<String, ByteArray>? = null
+        runCatching {
+            context.contentResolver.query(
+                Uri.parse("content://mms/part"),
+                arrayOf("_id", "ct", "text"), "mid=$mmsId", null, null,
+            )?.use { p ->
+                val iPid = p.getColumnIndexOrThrow("_id")
+                val iCt = p.getColumnIndexOrThrow("ct")
+                val iText = p.getColumnIndexOrThrow("text")
+                while (p.moveToNext()) {
+                    val ct = p.getString(iCt) ?: continue
+                    when {
+                        ct.startsWith("text/") ->
+                            p.getString(iText)?.let { text = (text + "\n" + it).trim() }
+                        ct.startsWith("image/") && image == null -> {
+                            val bytes = runCatching {
+                                context.contentResolver.openInputStream(
+                                    Uri.parse("content://mms/part/${p.getLong(iPid)}")
+                                )?.use { it.readBytes() }
+                            }.getOrNull()
+                            if (bytes != null) image = ct to bytes
+                        }
+                    }
+                }
+            }
+        }
+        return text to image
     }
 
     /** Re-resolve every SMS thread against the address book: fill in a newly-saved contact's name
@@ -175,6 +288,17 @@ class SmsTransport(
         conversation: ConversationEntity, body: String, replyTo: MessageEntity?,
     ): Result<Unit> =
         withContext(Dispatchers.IO) {
+            // A group thread has no single SMS destination; group texts go as an MMS to everyone.
+            if (conversation.externalId.startsWith("group:")) return@withContext runCatching {
+                val rowId = repo.recordMessage(
+                    MessageEntity(
+                        conversationId = conversation.id, transportId = ID, externalId = null,
+                        sender = "me", body = body, timestamp = System.currentTimeMillis(),
+                        outgoing = true, status = MessageStatus.PENDING,
+                    )
+                )
+                dispatchMms(conversation, rowId, body.ifBlank { null }, emptyList())
+            }
             runCatching { // SMS has no inline-reply concept; replyTo is ignored.
                 val smsManager = context.getSystemService(SmsManager::class.java)
                 val parts = smsManager.divideMessage(body)
@@ -210,6 +334,15 @@ class SmsTransport(
             Telephony.Threads.getOrCreateThreadId(context, address)
         }
         upsertSmsConversation(threadId.toString(), address).id
+    }
+
+    /** Start (or reopen) a group MMS thread with [addresses] (two or more other people). */
+    suspend fun startGroup(addresses: List<String>): Result<Long> = withContext(Dispatchers.IO) {
+        runCatching {
+            val members = addresses.map { it.trim() }.filter { it.isNotEmpty() }.distinctBy { numKey(it) }
+            require(members.size >= 2) { "a group needs at least two people" }
+            upsertGroupMms(members).id
+        }
     }
 
     /** Entry point for SmsDeliverReceiver. */
@@ -293,17 +426,26 @@ class SmsTransport(
         }.onFailure { repo.setMessageStatus(message.id, MessageStatus.FAILED) }
     }
 
-    /** Build an MMS PDU for [media] and hand it to the platform, wiring the result back to [rowId]. */
     private fun dispatchMms(
         conversation: ConversationEntity, rowId: Long, media: ByteArray,
         mime: String, fileName: String, caption: String,
+    ) = dispatchMms(conversation, rowId, caption.ifBlank { null }, listOf(MmsCompose.Image(mime, media, fileName)))
+
+    /** Build an MMS PDU (text and/or images) and hand it to the platform, wiring the result back to
+     *  [rowId]. Recipients come from the conversation address (comma/semicolon-separated for groups),
+     *  minus our own number so a group MMS isn't also sent back to us. */
+    private fun dispatchMms(
+        conversation: ConversationEntity, rowId: Long, text: String?, images: List<MmsCompose.Image>,
     ) {
+        val self = selfNumbers()
+        val recipients = conversation.address.split(",", ";").map { it.trim() }
+            .filter { it.isNotEmpty() && numKey(it) !in self }
         val txn = java.util.UUID.randomUUID().toString()
         val pdu = MmsCompose.sendReq(
             transactionId = txn,
-            recipients = conversation.address.split(",", ";").map { it.trim() }.filter { it.isNotEmpty() },
-            text = caption.ifBlank { null },
-            images = listOf(MmsCompose.Image(mime, media, fileName)),
+            recipients = recipients,
+            text = text,
+            images = images,
         )
         val dir = File(context.cacheDir, "mms").apply { mkdirs() }
         val file = File(dir, "$txn.send.pdu").apply { writeBytes(pdu) }
@@ -344,7 +486,7 @@ class SmsTransport(
         val from = notif?.from
         val location = notif?.contentLocation
         if (location.isNullOrBlank()) {
-            recordMms(from, "📎 MMS received (no download location)", emptyList())
+            recordMms(from, emptyList(), "📎 MMS received (no download location)", emptyList())
             return
         }
         withContext(Dispatchers.IO) {
@@ -370,7 +512,7 @@ class SmsTransport(
                 )
                 context.getSystemService(SmsManager::class.java)
                     .downloadMultimediaMessage(context, location, uri, null, pi)
-            }.onFailure { recordMms(from, "📎 MMS received (download failed)", emptyList()) }
+            }.onFailure { recordMms(from, emptyList(), "📎 MMS received (download failed)", emptyList()) }
         }
     }
 
@@ -381,19 +523,36 @@ class SmsTransport(
             (if (ok && f.exists()) runCatching { f.readBytes() }.getOrNull() else null).also { f.delete() }
         }
         if (bytes == null) {
-            recordMms(from, "📎 MMS received (couldn't download)", emptyList()); return
+            recordMms(from, emptyList(), "📎 MMS received (couldn't download)", emptyList()); return
         }
         val r = runCatching { MmsPdu.parseRetrieveConf(bytes) }.getOrNull()
-        recordMms(r?.from ?: from, r?.text.orEmpty(), r?.images ?: emptyList())
+        recordMms(r?.from ?: from, r?.to ?: emptyList(), r?.text.orEmpty(), r?.images ?: emptyList())
     }
 
-    /** Persist a received MMS (image parts as media rows, plus any text) and notify. */
-    private suspend fun recordMms(from: String?, text: String, images: List<MmsPdu.Part>) {
+    /** Persist a received MMS (image parts as media rows, plus any text) and notify. Reconstructs a
+     *  group thread when the message was addressed to multiple people (From + To/Cc). */
+    private suspend fun recordMms(
+        from: String?, to: List<String>, text: String, images: List<MmsPdu.Part>,
+    ) {
         val address = from ?: "MMS"
-        val threadId = withContext(Dispatchers.IO) {
-            Telephony.Threads.getOrCreateThreadId(context, address)
+        // Distinct participants across sender + all recipients. Three or more (you + two others)
+        // means a group; two (you + sender) is an ordinary 1:1.
+        val participants = (listOf(address) + to).map { it.trim() }.filter { it.isNotEmpty() }
+            .distinctBy { numKey(it) }
+        val convo = if (participants.count { numKey(it).length >= 7 } >= 3)
+            upsertGroupMms(participants)
+        else {
+            val threadId = withContext(Dispatchers.IO) {
+                Telephony.Threads.getOrCreateThreadId(context, address)
+            }
+            upsertSmsConversation(threadId.toString(), address)
         }
-        val convo = upsertSmsConversation(threadId.toString(), address)
+        // Cache the sender's contact name so the group bubble can label them.
+        if (convo.externalId.startsWith("group:")) {
+            lookupContactName(address)?.let {
+                (context as? com.sidephone.aviary.RelayApp)?.contactNames?.put(address, it)
+            }
+        }
         val now = System.currentTimeMillis()
         images.forEachIndexed { i, part ->
             val path = withContext(Dispatchers.IO) { mediaStore.save(part.data, part.contentType) }
@@ -420,15 +579,65 @@ class SmsTransport(
             images.isNotEmpty() -> "📷 Photo"
             else -> "📎 MMS"
         }
-        notifyIncoming(convo, preview)
+        notifyIncoming(convo, preview, sender = address)
     }
 
-    private fun notifyIncoming(convo: ConversationEntity, body: String) {
+    // ---- group MMS helpers -------------------------------------------------
+
+    /** Last-10-digit key for a phone number, so formatting/country-code differences collapse. */
+    private fun numKey(addr: String): String = addr.filter { it.isDigit() }.takeLast(10)
+
+    /** Best-effort set of this device's own numbers, to exclude us from group membership/sends. */
+    private fun selfNumbers(): Set<String> {
+        val out = HashSet<String>()
+        runCatching {
+            context.getSystemService(android.telephony.TelephonyManager::class.java)
+                ?.line1Number?.let { numKey(it).takeIf { k -> k.length >= 7 }?.let(out::add) }
+        }
+        runCatching {
+            @Suppress("MissingPermission")
+            context.getSystemService(android.telephony.SubscriptionManager::class.java)
+                ?.activeSubscriptionInfoList?.forEach { info ->
+                    info.number?.let { numKey(it).takeIf { k -> k.length >= 7 }?.let(out::add) }
+                }
+        }
+        return out
+    }
+
+    /** Find or create the group thread for a participant set, keyed by the sorted member numbers so
+     *  every message among the same people lands in one thread. Excludes our own number from the
+     *  send list and title when we can detect it. */
+    private suspend fun upsertGroupMms(participants: List<String>): ConversationEntity {
+        val self = selfNumbers()
+        val others = participants.filter { numKey(it) !in self }.ifEmpty { participants }
+        val key = "group:mms:" + others.map { numKey(it) }.sorted().joinToString(",")
+        val names = others.map { lookupContactName(it) ?: it }
+        val title = when {
+            names.size <= 3 -> names.joinToString(", ")
+            else -> names.take(2).joinToString(", ") + " +${names.size - 2}"
+        }
+        val anyKnown = others.any { lookupContactName(it) != null }
+        return repo.upsertConversation(
+            transportId = ID,
+            externalId = key,
+            address = others.joinToString(";"),
+            title = title,
+            category = if (anyKnown) InboxCategory.PRIMARY else InboxCategory.SECONDARY,
+        )
+    }
+
+    private fun notifyIncoming(convo: ConversationEntity, body: String, sender: String? = null) {
         // SMS/MMS threads are direct person-to-person, so they notify even in Secondary
         // (the "direct threads in Secondary still notify" rule); only muted-group chats stay quiet.
+        val isGroup = convo.externalId.startsWith("group:")
+        val senderName = sender?.let { lookupContactName(it) ?: it } ?: convo.title
         com.sidephone.aviary.data.Notifier.post(
-            context, convo.id, sender = convo.title, body = body,
+            context, convo.id,
+            sender = if (isGroup) senderName else convo.title,
+            body = body,
             avatarPath = avatarStore.path(convo.externalId),
+            isGroup = isGroup,
+            groupTitle = if (isGroup) convo.title else null,
             muted = convo.muted,
         )
     }

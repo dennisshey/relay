@@ -20,6 +20,9 @@ object MmsPdu {
     data class Part(val contentType: String, val data: ByteArray)
     data class Retrieved(
         val from: String?,
+        /** To + Cc recipients (everyone the message was addressed to, which for an inbound group
+         *  MMS includes you and the other members — used to reconstruct the group thread). */
+        val to: List<String>,
         val subject: String?,
         val dateSeconds: Long?,
         val parts: List<Part>,
@@ -32,6 +35,8 @@ object MmsPdu {
 
     // MMS header field codes (already OR'd with 0x80 as they appear on the wire).
     private const val FROM = 0x89
+    private const val TO = 0x97
+    private const val CC = 0x82
     private const val CONTENT_LOCATION = 0x83
     private const val TRANSACTION_ID = 0x98
     private const val MESSAGE_TYPE = 0x8C
@@ -67,6 +72,7 @@ object MmsPdu {
     fun parseRetrieveConf(pdu: ByteArray): Retrieved {
         val r = Reader(pdu)
         var from: String? = null
+        val to = mutableListOf<String>()
         var subject: String? = null
         var date: Long? = null
         val parts = mutableListOf<Part>()
@@ -78,13 +84,14 @@ object MmsPdu {
                     MESSAGE_SIZE -> r.readLongInteger()
                     TRANSACTION_ID, MESSAGE_ID, CONTENT_LOCATION -> r.readTextString()
                     FROM -> from = r.readFromValue()
+                    TO, CC -> r.readEncodedString().clean().takeIf { it.isNotBlank() }?.let { to += it }
                     SUBJECT -> subject = r.readEncodedString()
                     CONTENT_TYPE -> { r.readContentType(); parts += r.readMultipart(); break@loop }
                     else -> if (field and 0x80 == 0) { r.readTextString(); r.readTextString() } else r.skipGeneric()
                 }
             }
         } catch (_: Exception) { /* best-effort: keep whatever parsed */ }
-        return Retrieved(from?.clean(), subject, date, parts)
+        return Retrieved(from?.clean(), to, subject, date, parts)
     }
 
     private fun String.clean(): String =
