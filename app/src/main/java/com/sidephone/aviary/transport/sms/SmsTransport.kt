@@ -29,6 +29,7 @@ import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class SmsTransport(
@@ -36,11 +37,16 @@ class SmsTransport(
     private val repo: UnifiedRepository,
     private val mediaStore: com.sidephone.aviary.data.MediaStore,
     private val avatarStore: com.sidephone.aviary.data.AvatarStore,
+    private val scope: kotlinx.coroutines.CoroutineScope,
 ) : MessageTransport {
 
     override val id = ID
     override val protocol = Protocol.SMS
     override val canStartConversations = true
+
+    // Re-sync contact names/photos whenever the address book changes, so a number you just saved
+    // stops showing as a bare number without needing an app restart.
+    @Volatile private var contactsObserver: android.database.ContentObserver? = null
 
     private val _status = MutableStateFlow<TransportStatus>(
         TransportStatus.NeedsSetup("Set Relay as the default SMS app")
@@ -66,17 +72,39 @@ class SmsTransport(
             return
         }
         syncFromTelephony()
-        runCatching { backfillContactPhotos() }
+        runCatching { syncContacts() }
+        registerContactsObserver()
         _status.value = TransportStatus.Ready
     }
 
-    /** Pull Android contact photos for existing SMS threads that don't have one cached yet, so
-     *  threads created before photo sync existed also show the contact's picture. */
-    private suspend fun backfillContactPhotos() = withContext(Dispatchers.IO) {
+    /** Re-resolve every SMS thread against the address book: fill in a newly-saved contact's name
+     *  (moving it from Secondary to Primary) and photo. Runs on start and whenever contacts change,
+     *  so saving a number that's been texting you updates the thread without an app restart. Never
+     *  overwrites a resolved name with a bare number (e.g. if contacts read transiently fails). */
+    private suspend fun syncContacts() = withContext(Dispatchers.IO) {
         for (c in repo.conversationsForTransport(ID)) {
-            if (avatarStore.has(c.externalId)) continue
-            val photo = lookupContact(c.address).second ?: continue
-            avatarStore.save(c.externalId, photo)
+            if (c.externalId.startsWith("group:") || c.address.equals("MMS", true)) continue
+            val (name, photo) = lookupContact(c.address)
+            if (name != null && name != c.title) {
+                repo.setConversationTitle(c.id, name)
+                if (c.category == InboxCategory.SECONDARY) repo.setCategory(c.id, InboxCategory.PRIMARY)
+            }
+            if (photo != null && !avatarStore.has(c.externalId)) avatarStore.save(c.externalId, photo)
+        }
+    }
+
+    private fun registerContactsObserver() {
+        if (contactsObserver != null) return
+        val obs = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                scope.launch { runCatching { syncContacts() } }
+            }
+        }
+        runCatching {
+            context.contentResolver.registerContentObserver(
+                ContactsContract.Contacts.CONTENT_URI, true, obs,
+            )
+            contactsObserver = obs
         }
     }
 

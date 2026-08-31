@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.DropdownMenu
@@ -265,6 +266,27 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                                 sendProtocol.displayName,
                                 style = MaterialTheme.typography.labelSmall,
                                 color = sendProtocol.color
+                            )
+                        }
+                    }
+                },
+                actions = {
+                    // Offer "add to contacts" for an unknown phone/email 1:1 (e.g. a new number that's
+                    // been texting you). Hidden once the address resolves to a saved contact.
+                    val addable = convo?.takeIf {
+                        !it.isGroup && (it.transportId == "sms" || it.transportId == "imessage")
+                    }
+                    if (addable != null) {
+                        val known by produceState(true, addable.address) {
+                            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                isKnownContact(context, addable.address)
+                            }
+                        }
+                        if (!known) IconButton(onClick = { addToContacts(context, addable.address) }) {
+                            Icon(
+                                Icons.Filled.PersonAdd,
+                                contentDescription = "Add to contacts",
+                                tint = MaterialTheme.colorScheme.primary,
                             )
                         }
                     }
@@ -637,6 +659,44 @@ private fun displayName(context: android.content.Context, uri: android.net.Uri):
 
 private fun protocolOf(app: RelayApp, msg: MessageEntity): Protocol =
     app.transports.byId(msg.transportId)?.protocol ?: Protocol.SMS
+
+/** Strip a "tel:"/"mailto:" scheme so we hand a plain number/email to contacts. */
+private fun bareHandle(address: String): String =
+    address.removePrefix("tel:").removePrefix("mailto:").trim()
+
+/** Whether a phone number or email already resolves to a saved Android contact. */
+private fun isKnownContact(context: android.content.Context, address: String): Boolean {
+    if (context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS)
+        != android.content.pm.PackageManager.PERMISSION_GRANTED
+    ) return true // no permission: don't nag with an add button we can't verify
+    val handle = bareHandle(address)
+    val uri = if (handle.contains("@"))
+        android.net.Uri.withAppendedPath(
+            android.provider.ContactsContract.CommonDataKinds.Email.CONTENT_FILTER_URI,
+            android.net.Uri.encode(handle),
+        )
+    else
+        android.net.Uri.withAppendedPath(
+            android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+            android.net.Uri.encode(handle),
+        )
+    return runCatching {
+        context.contentResolver.query(uri, arrayOf(android.provider.BaseColumns._ID), null, null, null)
+            ?.use { it.count > 0 } ?: false
+    }.getOrDefault(false)
+}
+
+/** Open the system "add contact" screen with the number/email prefilled. */
+private fun addToContacts(context: android.content.Context, address: String) {
+    val handle = bareHandle(address)
+    val intent = android.content.Intent(android.content.Intent.ACTION_INSERT_OR_EDIT).apply {
+        type = android.provider.ContactsContract.Contacts.CONTENT_ITEM_TYPE
+        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (handle.contains("@")) putExtra(android.provider.ContactsContract.Intents.Insert.EMAIL, handle)
+        else putExtra(android.provider.ContactsContract.Intents.Insert.PHONE, handle)
+    }
+    runCatching { context.startActivity(intent) }
+}
 
 /** iMessage look: colored bubble by protocol for outgoing, gray for incoming. */
 @OptIn(ExperimentalFoundationApi::class)

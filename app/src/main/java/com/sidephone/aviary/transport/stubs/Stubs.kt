@@ -484,6 +484,10 @@ class IMessageTransport(
             // Clean the leftover object-replacement glyph from old attachment captions.
             runCatching { repo.stripPlaceholderChars() }
                 .onFailure { Log.w(TAG, "strip placeholder chars failed", it) }
+            // Fill in names/photos for contacts saved after a thread was created, and keep them
+            // in sync as the address book changes.
+            runCatching { refreshContacts() }.onFailure { Log.w(TAG, "refresh contacts failed", it) }
+            registerContactsObserver()
             while (isActive) {
                 try {
                     val res = json(ImessageNative.nativePoll(30_000))
@@ -807,6 +811,36 @@ class IMessageTransport(
      * thread. Handles the case where a person messaged from two handles (email + phone) before
      * contact-based keying existed. Idempotent: safe to run on every launch.
      */
+    // Re-sync contact names/photos for iMessage threads whenever the address book changes, so a
+    // contact saved after the thread was created stops showing as a bare number/handle.
+    @Volatile private var contactsObserver: android.database.ContentObserver? = null
+
+    /** Re-resolve each 1:1 iMessage thread against contacts: fill in a name saved after the thread
+     *  was created, and cache the contact photo. Group chats keep their participant-list key. */
+    private suspend fun refreshContacts() = withContext(Dispatchers.IO) {
+        for (c in repo.conversationsForTransport(id)) {
+            if (c.externalId.contains(";")) continue // group chat
+            val (name, photo, _) = resolveContact(c.address)
+            if (name != null && name != c.title) repo.setConversationTitle(c.id, name)
+            if (photo != null && !avatarStore.has(c.externalId)) avatarStore.save(c.externalId, photo)
+        }
+    }
+
+    private fun registerContactsObserver() {
+        if (contactsObserver != null) return
+        val obs = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                scope.launch { runCatching { refreshContacts() } }
+            }
+        }
+        runCatching {
+            context.contentResolver.registerContentObserver(
+                ContactsContract.Contacts.CONTENT_URI, true, obs,
+            )
+            contactsObserver = obs
+        }
+    }
+
     private suspend fun mergeDuplicateContactThreads() {
         val convos = repo.conversationsForTransport(id)
         val byKey = LinkedHashMap<String, MutableList<com.sidephone.aviary.data.ConversationEntity>>()
