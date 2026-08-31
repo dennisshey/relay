@@ -127,7 +127,13 @@ fun NewMessageScreen(app: RelayApp, onOpenThread: (Long) -> Unit, onBack: () -> 
                             else app.smsTransport.startConversation(addr)
                         }
                     },
-                    onStartGroup = { numbers -> run { app.smsTransport.startGroup(numbers) } },
+                    onStartGroup = { numbers ->
+                        // All members on iMessage -> a blue iMessage group; otherwise a group MMS.
+                        run {
+                            val imsg = app.imessageTransport.startGroup(numbers)
+                            if (imsg.isSuccess) imsg else app.smsTransport.startGroup(numbers)
+                        }
+                    },
                 )
                 NewChatNetwork.SIGNAL -> SignalPicker(app, query, busy, onOpenThread,
                     onStartNew = { run { app.signalTransport.startConversation(it) } },

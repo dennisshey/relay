@@ -288,6 +288,32 @@ class IMessageTransport(
         return JSONArray().apply { handles.distinct().forEach { put(it) } }.toString()
     }
 
+    /** Canonical key for an iMessage group: each member normalized to a tel:/mailto: handle, our own
+     *  handles removed, lowercased, de-duped and sorted, joined by ";". Applied to both the native
+     *  chat string on receive and a group we create, so the two map to the same thread regardless of
+     *  the order/format Apple sends. */
+    private fun canonicalGroupKey(chat: String): String =
+        chat.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+            .map { imessageHandle(it).lowercase() }
+            .filterNot { cleanHandle(it) in selfHandles }
+            .distinct().sorted().joinToString(";")
+
+    /** Start (or reopen) an iMessage group with [addresses]. Fails unless every member is reachable
+     *  on iMessage, so the caller can fall back to a group MMS. */
+    suspend fun startGroup(addresses: List<String>): Result<Long> = withContext(Dispatchers.IO) {
+        runCatching {
+            val handles = addresses.map { imessageHandle(it) }.distinct()
+            require(handles.size >= 2) { "a group needs at least two people" }
+            require(handles.all { canReach(it) }) { "not everyone is on iMessage" }
+            val key = canonicalGroupKey(handles.joinToString(";"))
+            require(key.contains(";")) { "need at least two other members" }
+            repo.upsertConversation(
+                transportId = id, externalId = key, address = key,
+                title = groupTitleFor(key), category = InboxCategory.PRIMARY,
+            ).id
+        }
+    }
+
     /** A group's display title from its members' names (we're excluded), e.g. "Alice, Bob +2". */
     private fun groupTitleFor(chat: String): String {
         val members = chat.split(";").map { it.trim() }
@@ -610,9 +636,11 @@ class IMessageTransport(
 
         val (name, photo, contactId) = resolveContact(address)
         val desiredTitle = name ?: cleanHandle(address)
-        // Key 1:1 chats by the resolved contact so a person reached by both email and phone
-        // stays a single thread; fall back to the raw chat id when there's no contact match.
-        val convoKey = if (!chat.contains(";") && contactId != null) "imc:$contactId" else chat
+        // A group chat is keyed by its canonical participant set (so a group we created and Apple's
+        // echo of it map to one thread). 1:1 chats key by the resolved contact so a person reached
+        // by both email and phone stays a single thread; else the raw chat id.
+        val groupKey = if (chat.contains(";")) canonicalGroupKey(chat).takeIf { it.contains(";") } else null
+        val convoKey = groupKey ?: if (contactId != null) "imc:$contactId" else chat
         // When this chat now resolves to a saved contact, fold any pre-existing raw-handle thread
         // (created before the contact was saved, keyed by "mailto:"/"tel:") into the contact-keyed
         // thread. Without this, once a contact becomes resolvable, new messages fork into a second
@@ -656,9 +684,8 @@ class IMessageTransport(
             }
         } else null
         // A group thread is titled + addressed by its whole participant list, not the last sender.
-        val isGroupChat = chat.contains(";")
-        val convoTitle = if (isGroupChat) groupTitleFor(chat) else desiredTitle
-        val convoAddress = if (isGroupChat) chat else address
+        val convoTitle = if (groupKey != null) groupTitleFor(groupKey) else desiredTitle
+        val convoAddress = groupKey ?: address
         val convo = natural ?: folded ?: repo.upsertConversation(
             transportId = id,
             externalId = convoKey,
@@ -668,9 +695,9 @@ class IMessageTransport(
         )
         // Reconcile the title (upgrades old "mailto:" titles / repairs a group mis-titled after a
         // sender), but don't clobber a good SMS-thread title we've folded into.
-        if (isGroupChat) {
+        if (groupKey != null) {
             if (convo.title != convoTitle) repo.setConversationTitle(convo.id, convoTitle)
-            if (convo.address != chat) repo.setConversationAddress(convo.id, chat)
+            if (convo.address != groupKey) repo.setConversationAddress(convo.id, groupKey)
         } else if (folded == null && convo.title != desiredTitle) {
             repo.setConversationTitle(convo.id, desiredTitle)
         }
@@ -698,7 +725,7 @@ class IMessageTransport(
             )
         )
         if (rowId > 0 && !fromMe) {
-            val isGroup = chat.contains(";")
+            val isGroup = groupKey != null
             val mentioned = msg.optBoolean("mentioned", false)
             // Secondary groups notify only when you're @mentioned; secondary 1:1 threads still
             // notify for every message; primary always notifies.
