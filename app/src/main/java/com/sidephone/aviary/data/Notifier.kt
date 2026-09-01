@@ -45,7 +45,9 @@ object Notifier {
     ) {
         if (muted) return // Secondary-inbox conversations are silent
         val app = context.applicationContext as? RelayApp
-        if (app?.foregroundConversationId == conversationId) return // thread is on screen
+        // Suppress only when the thread is genuinely on screen: the app must also be foregrounded,
+        // so a stale foreground id (e.g. the phone slept inside this thread) can't swallow it.
+        if (app?.foregroundConversationId == conversationId && app.isForeground) return
 
         // Always show an avatar: the real photo (downsampled + cached, not a full-size decode on
         // every post), or a colored initials circle like iMessage.

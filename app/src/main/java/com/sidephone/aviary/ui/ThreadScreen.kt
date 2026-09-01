@@ -144,24 +144,54 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
         value = app.router.resolve(c).protocol
     }
 
+    // "On screen" has to mean composed AND actually visible. Composition survives the screen going
+    // off, so without the lifecycle check a message arriving while the phone sleeps in this thread
+    // would be silently marked read, have a read receipt sent, and have its notification suppressed.
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    var threadVisible by remember { mutableStateOf(false) }
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, conversationId) {
+        fun claim() {
+            threadVisible = true
+            app.foregroundConversationId = conversationId
+            com.sidephone.aviary.data.Notifier.cancel(app, conversationId)
+        }
+        fun release() {
+            threadVisible = false
+            if (app.foregroundConversationId == conversationId) app.foregroundConversationId = null
+        }
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_START -> claim()
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> release()
+                else -> Unit
+            }
+        }
+        if (lifecycleOwner.lifecycle.currentState
+                .isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+        ) claim()
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            release()
+        }
+    }
+
     // Clear unread on open AND whenever a new message arrives while the thread is on screen,
     // so the inbox's blue dot never lingers after you've actually seen the message.
-    LaunchedEffect(conversationId, messages.lastOrNull()?.id) { app.repository.markRead(conversationId) }
+    LaunchedEffect(conversationId, messages.lastOrNull()?.id, threadVisible) {
+        if (threadVisible) app.repository.markRead(conversationId)
+    }
     // Read receipts + typing follow the conversation's OWN transport — never the send-time route.
     // Routing an SMS thread through iMessage (because the number is iMessage-reachable) would send
     // an iMessage read receipt for a non-iMessage chat, which isn't valid.
-    LaunchedEffect(convo?.id, messages.lastOrNull()?.id) {
+    LaunchedEffect(convo?.id, messages.lastOrNull()?.id, threadVisible) {
+        if (!threadVisible) return@LaunchedEffect
         convo?.let { c -> runCatching { app.transports.byId(c.transportId)?.markConversationRead(c) } }
     }
-    // Tell the other side we're typing while there's a non-empty draft.
-    LaunchedEffect(draft.isNotBlank(), convo?.id) {
-        convo?.let { c -> runCatching { app.transports.byId(c.transportId)?.sendTyping(c, draft.isNotBlank()) } }
-    }
-    // While this thread is open, suppress its notifications and clear any already shown.
-    androidx.compose.runtime.DisposableEffect(conversationId) {
-        app.foregroundConversationId = conversationId
-        com.sidephone.aviary.data.Notifier.cancel(app, conversationId)
-        onDispose { if (app.foregroundConversationId == conversationId) app.foregroundConversationId = null }
+    // Tell the other side we're typing while there's a non-empty draft (never while asleep).
+    LaunchedEffect(draft.isNotBlank(), convo?.id, threadVisible) {
+        val typing = draft.isNotBlank() && threadVisible
+        convo?.let { c -> runCatching { app.transports.byId(c.transportId)?.sendTyping(c, typing) } }
     }
     // Jump to the newest message when the thread first opens.
     LaunchedEffect(conversationId, messages.isNotEmpty()) {
