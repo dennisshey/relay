@@ -899,6 +899,14 @@ class IMessageTransport(
                 val title = groupTitleFor(c.externalId)
                 if (c.title != title) repo.setConversationTitle(c.id, title)
                 if (c.address != c.externalId) repo.setConversationAddress(c.id, c.externalId)
+                // Cache every member's name so messages ALREADY in the thread label by name rather
+                // than a raw handle — otherwise old bubbles stay numeric until that person writes.
+                val names = (context as? com.sidephone.aviary.RelayApp)?.contactNames
+                if (names != null) for (member in c.externalId.split(";")) {
+                    val handle = member.trim()
+                    if (handle.isEmpty()) continue
+                    resolveContact(handle).first?.let { names.put(cleanHandle(handle), it) }
+                }
                 continue
             }
             val (name, photo, _) = resolveContact(c.address)
