@@ -24,8 +24,12 @@ import com.sidephone.aviary.data.ConversationEntity
 import java.io.File
 import kotlin.math.absoluteValue
 
-/** Signal group threads are keyed by "group:<masterKey>". */
-val ConversationEntity.isGroup: Boolean get() = externalId.startsWith("group:")
+/**
+ * Group threads: Signal + group MMS are keyed "group:<id>"; an iMessage group is keyed by its
+ * ";"-joined participant list. Drives the group avatar and the per-sender name labels on bubbles.
+ */
+val ConversationEntity.isGroup: Boolean
+    get() = externalId.startsWith("group:") || externalId.contains(";")
 
 private val AvatarPalette = listOf(
     Color(0xFF3B82F6), Color(0xFF8B5CF6), Color(0xFFEC4899), Color(0xFFF97316),

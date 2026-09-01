@@ -732,6 +732,10 @@ class IMessageTransport(
             val muted = convo.muted ||
                 (convo.category == InboxCategory.SECONDARY && isGroup && !mentioned)
             val senderName = if (isGroup) (resolveContact(sender).first ?: cleanHandle(sender)) else desiredTitle
+            // Cache the member's name so the group bubble labels them by name, not a raw handle.
+            if (isGroup) resolveContact(sender).first?.let {
+                (context as? com.sidephone.aviary.RelayApp)?.contactNames?.put(cleanHandle(sender), it)
+            }
             com.sidephone.aviary.data.Notifier.post(
                 context, convo.id,
                 sender = senderName,
