@@ -65,6 +65,14 @@ class UnifiedRepository(private val db: AviaryDatabase) {
     suspend fun setGroupName(id: Long, groupName: String?) =
         db.conversations().setGroupName(id, groupName?.takeIf { it.isNotBlank() })
 
+    /** Set a group's protocol id (iMessage's `gid`). */
+    suspend fun setGroupId(id: Long, groupId: String?) =
+        db.conversations().setGroupId(id, groupId?.takeIf { it.isNotBlank() })
+
+    /** The thread for a protocol group id, regardless of who is currently in the group. */
+    suspend fun conversationByGroupId(transportId: String, groupId: String): ConversationEntity? =
+        db.conversations().byGroupId(transportId, groupId)
+
     /**
      * Move a single already-stored message into [conversationId]. Repairs rows filed under the
      * wrong thread — a group message that an earlier build's phone-number merge swallowed into a

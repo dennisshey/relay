@@ -312,8 +312,14 @@ async fn build_statuskit(
     config_dir: PathBuf,
 ) -> Option<Arc<StatusKitClient<Prov>>> {
     let gsa = config.get_gsa_config(&*connection.state.read().await, false);
-    let account = AppleAccount::new_with_anisette(gsa, anisette).ok()?;
-    let token_provider = TokenProvider::new(Arc::new(DebugMutex::new(account)), config.clone());
+    let account =
+        AppleAccount::new_with_anisette(gsa, anisette, None, Box::new(|_| {})).ok()?;
+    let token_provider = TokenProvider::new(
+        Arc::new(DebugMutex::new(account)),
+        config.clone(),
+        Default::default(),
+        Box::new(|_| {}),
+    );
 
     let sk_path = config_dir.join("statuskit.plist");
     let sk_state: StatusKitState = std::fs::read(&sk_path)
@@ -515,7 +521,8 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeL
         let gsa = s
             .config
             .get_gsa_config(&*s.connection.state.read().await, false);
-        let mut account = match AppleAccount::new_with_anisette(gsa, s.anisette.clone()) {
+        let mut account =
+            match AppleAccount::new_with_anisette(gsa, s.anisette.clone(), None, Box::new(|_| {})) {
             Ok(a) => a,
             Err(e) => return err(format!("account: {e}")),
         };
@@ -697,9 +704,9 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeS
             Some(s) => s,
             None => return err("not initialized"),
         };
-        let participants: Vec<String> = match serde_json::from_str::<Vec<String>>(&participants_json) {
-            Ok(p) => p.iter().map(|h| format_handle(h)).collect(),
-            Err(e) => return err(format!("bad participants: {e}")),
+        let (participants, cv_name, sender_guid) = match ParticipantsArg::parse(&participants_json) {
+            Ok(v) => v,
+            Err(e) => return err(e),
         };
         let want_handles = participants.clone();
         // Scope the client borrow so we can update sk_want (focus-status subscriptions) after.
@@ -723,8 +730,8 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeS
             let mut msg = MessageInst::new(
                 ConversationData {
                     participants,
-                    cv_name: None,
-                    sender_guid: None,
+                    cv_name,
+                    sender_guid,
                     after_guid: None,
                 },
                 &handle,
@@ -793,17 +800,55 @@ fn reaction_from_emoji(e: &str) -> Reaction {
     }
 }
 
+/// The participants argument accepted by every send entry point. It is either a bare JSON array
+/// of handles (a 1:1, or a group we have no name/id for), or an object that also carries the
+/// group's identity:
+///
+/// ```json
+/// {"participants":["tel:+1…","mailto:…"],"cv_name":"Trivia Night","sender_guid":"UUID"}
+/// ```
+///
+/// The identity matters for NAMED groups: iMessage matches those on the group id (and carries the
+/// name alongside), not on the participant set. Sending without them made every reply open a
+/// fresh unnamed group on the recipients' devices instead of landing in the named one.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ParticipantsArg {
+    Plain(Vec<String>),
+    WithGroup {
+        participants: Vec<String>,
+        #[serde(default)]
+        cv_name: Option<String>,
+        #[serde(default)]
+        sender_guid: Option<String>,
+    },
+}
+
+impl ParticipantsArg {
+    /// Parse the argument into (handles, cv_name, sender_guid), normalizing each handle.
+    fn parse(json: &str) -> Result<(Vec<String>, Option<String>, Option<String>), String> {
+        let parsed: ParticipantsArg =
+            serde_json::from_str(json).map_err(|e| format!("bad participants: {e}"))?;
+        let (raw, cv_name, sender_guid) = match parsed {
+            ParticipantsArg::Plain(p) => (p, None, None),
+            ParticipantsArg::WithGroup { participants, cv_name, sender_guid } => {
+                (participants, cv_name, sender_guid)
+            }
+        };
+        let handles: Vec<String> = raw.iter().map(|h| format_handle(h)).collect();
+        // Treat blanks as absent so callers can pass "" rather than omitting the field.
+        let blank = |v: Option<String>| v.filter(|x| !x.is_empty());
+        Ok((handles, blank(cv_name), blank(sender_guid)))
+    }
+}
+
 /// Build the ConversationData + our handle for an outbound message to `participants_json`.
 async fn convo_for(
     s: &AviaryImessage,
     participants_json: &str,
 ) -> Result<(ConversationData, String), String> {
     let client = s.client.as_ref().ok_or("not registered")?;
-    let participants: Vec<String> = serde_json::from_str::<Vec<String>>(participants_json)
-        .map_err(|e| format!("bad participants: {e}"))?
-        .iter()
-        .map(|h| format_handle(h))
-        .collect();
+    let (participants, cv_name, sender_guid) = ParticipantsArg::parse(participants_json)?;
     let handle = client
         .identity
         .get_handles()
@@ -812,7 +857,7 @@ async fn convo_for(
         .cloned()
         .ok_or("no handle")?;
     Ok((
-        ConversationData { participants, cv_name: None, sender_guid: None, after_guid: None },
+        ConversationData { participants, cv_name, sender_guid, after_guid: None },
         handle,
     ))
 }
@@ -1255,6 +1300,8 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeP
                     if others.is_empty() { others.push(sender.clone()); }
                     return ok(serde_json::json!({
                         "empty": false, "typing": *active, "chat": others.join(";"),
+                        "cv_name": m.conversation.as_ref().and_then(|c| c.cv_name.clone()),
+                        "sender_guid": m.conversation.as_ref().and_then(|c| c.sender_guid.clone()),
                     }));
                 }
                 // Message edited or unsent by the other party.
@@ -1277,6 +1324,11 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeP
                     .as_ref()
                     .map(|c| c.participants.clone())
                     .unwrap_or_default();
+                // A named group is identified by its group id, and carries its display name on
+                // every message. Surface both: the name is what the thread should be titled, and
+                // the id is what a reply must be addressed with to land in that same chat.
+                let cv_name = m.conversation.as_ref().and_then(|c| c.cv_name.clone());
+                let sender_guid = m.conversation.as_ref().and_then(|c| c.sender_guid.clone());
                 // Conversation key = the OTHER participants (everything that isn't one of my
                 // own handles), sorted. Same key whether I sent or received.
                 let mut others: Vec<String> = participants
@@ -1337,6 +1389,8 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeP
                         "from_me": from_me,
                         "chat": chat,
                         "address": address,
+                        "cv_name": cv_name,
+                        "sender_guid": sender_guid,
                         "text": clean_text.unwrap_or_default(),
                         "reply_to": reply_to,
                         "timestamp": m.sent_timestamp,
@@ -1373,6 +1427,35 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeH
         let handles = client.identity.get_handles().await;
         log::info!("[relay] handles = {:?}", handles);
         ok(serde_json::json!({ "handles": handles }))
+    });
+    ret(&env, out)
+}
+
+/// Diagnostic: run the full validation-data (NAC) flow once and report the size of the blob.
+/// The emulated IMDAppleServices is only exercised at registration, so without this a broken
+/// port stays invisible until a re-register fails. A healthy run is 517 bytes; a short blob
+/// (389) means a data-producing hook missed and Apple would answer status 6001.
+#[no_mangle]
+pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeTestNac(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let out = with_state(|cell| async move {
+        let mut guard = cell.lock().await;
+        let s = match guard.as_mut() {
+            Some(s) => s,
+            None => return err("not initialized"),
+        };
+        let config = s.config.clone();
+        // Don't hold the state lock across the two network round trips to Apple.
+        drop(guard);
+        match config.generate_validation_data().await {
+            Ok(v) => {
+                log::info!("[relay] nac self-test: {} bytes", v.len());
+                ok(serde_json::json!({ "bytes": v.len() }))
+            }
+            Err(e) => err(format!("nac: {e}")),
+        }
     });
     ret(&env, out)
 }

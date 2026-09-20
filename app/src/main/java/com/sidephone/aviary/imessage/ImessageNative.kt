@@ -60,6 +60,9 @@ object ImessageNative {
     /** Diagnostic: generate on-device anisette (ADI) headers; returns JSON {ok, headers}. */
     external fun nativeTestAnisette(): String
 
+    /** Diagnostic: run the validation-data (NAC) flow once; {"ok":true,"bytes":N}. */
+    external fun nativeTestNac(): String
+
     /** The Apple ADI libraries, bundled as assets, that the native provider dlopen-loads. */
     private val ADI_LIBS = listOf(
         "libstoreservicescore.so", // main ADI proxy (11 flat symbols)

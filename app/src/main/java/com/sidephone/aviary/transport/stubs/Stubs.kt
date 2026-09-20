@@ -318,13 +318,24 @@ class IMessageTransport(
      *  to every member except us; a 1:1 sends to the single handle. rustpush keys the group by its
      *  participant set, so addressing all members continues the same iMessage group. */
     private fun participantsJson(convo: ConversationEntity): String {
-        val handles = if (convo.externalId.contains(";")) {
+        val isGroup = convo.externalId.contains(";")
+        val handles = if (isGroup) {
             convo.externalId.split(";").map { it.trim() }.filter { it.isNotEmpty() }
                 .map { imessageHandle(it) }
                 .filterNot { isSelfHandle(it) }
                 .ifEmpty { convo.externalId.split(";").filter { it.isNotBlank() }.map { imessageHandle(it.trim()) } }
         } else listOf(imessageHandle(convo.address))
-        return JSONArray().apply { handles.distinct().forEach { put(it) } }.toString()
+        val list = JSONArray().apply { handles.distinct().forEach { put(it) } }
+        // A named group is matched on its id, not its member list. Send both back, or the message
+        // opens a brand-new unnamed group on everyone else's device instead of joining this one.
+        val groupId = convo.groupId?.takeIf { it.isNotBlank() }
+        val groupName = convo.groupName?.takeIf { it.isNotBlank() }
+        if (!isGroup || (groupId == null && groupName == null)) return list.toString()
+        return JSONObject().apply {
+            put("participants", list)
+            if (groupName != null) put("cv_name", groupName)
+            if (groupId != null) put("sender_guid", groupId)
+        }.toString()
     }
 
     /** Canonical key for an iMessage group: each member normalized to a tel:/mailto: handle, our own
@@ -582,6 +593,14 @@ class IMessageTransport(
             // Clean the leftover object-replacement glyph from old attachment captions.
             runCatching { repo.stripPlaceholderChars() }
                 .onFailure { Log.w(TAG, "strip placeholder chars failed", it) }
+            // One-time: prove the emulated validation-data path still works. It is only
+            // exercised at registration, so a regression there would otherwise stay hidden
+            // until a re-register failed. Runs once per install, then never again.
+            if (!prefs.getBoolean(KEY_NAC_CHECKED, false)) {
+                runCatching { Log.i(TAG, "nativeTestNac => ${ImessageNative.nativeTestNac()}") }
+                    .onFailure { Log.e(TAG, "nac self-test", it) }
+                prefs.edit().putBoolean(KEY_NAC_CHECKED, true).apply()
+            }
             // One-time repair: drop the contact photo earlier builds saved as a group thread's
             // avatar (it was the first participant's face, and the store is write-once).
             runCatching { dropGroupMemberAvatars() }
@@ -675,6 +694,9 @@ class IMessageTransport(
         val sender = msg.optString("sender")
         val text = msg.optString("text", "")
         val guid = msg.optString("guid").ifBlank { null }
+        // A named group carries its display name ("n") and its group id ("gid") on every message.
+        val cvName = msg.optStringOrNull("cv_name")
+        val incomingGroupId = msg.optStringOrNull("sender_guid")
         if (guid != null && !seenGuids.add(guid)) return // already handled this session
         // Use the actual iMessage send time (Unix ms) so ordering is chronological.
         val timestamp = msg.optLong("timestamp", 0L).let { if (it > 0) it else System.currentTimeMillis() }
@@ -707,7 +729,24 @@ class IMessageTransport(
         // Prefer this message's NATURAL iMessage thread if it already exists; only when it doesn't
         // yet do we fold into an existing SMS thread for the same number (the "SMS thread converts
         // to iMessage" case). This avoids diverting an active iMessage thread onto a stray SMS one.
-        val natural = repo.conversationByExternal(id, convoKey)
+        // Prefer the thread carrying this group's id: the member list changes when someone is
+        // added or removed, but the id doesn't, so keying off it alone keeps one thread. If a
+        // participant-keyed thread for the new member set already exists (created before we knew
+        // the id), fold it in rather than leaving two.
+        val byGroupId = if (groupKey != null && incomingGroupId != null)
+            repo.conversationByGroupId(id, incomingGroupId) else null
+        val natural = if (byGroupId != null) {
+            val byKey = repo.conversationByExternal(id, convoKey)
+            if (byKey != null && byKey.id != byGroupId.id) {
+                Log.i(TAG, "fold group thread ${byKey.id} ('$convoKey') into ${byGroupId.id} (gid $incomingGroupId)")
+                repo.mergeConversations(byGroupId.id, byKey.id)
+            }
+            if (byGroupId.externalId != convoKey) {
+                Log.i(TAG, "group ${byGroupId.id} membership changed: '${byGroupId.externalId}' -> '$convoKey'")
+                repo.setConversationExternalId(byGroupId.id, convoKey)
+            }
+            repo.getConversation(byGroupId.id) ?: byGroupId
+        } else repo.conversationByExternal(id, convoKey)
         // Fold this iMessage into an existing SMS thread for the same person so we keep ONE thread.
         // A phone-handle iMessage matches by its own number; an EMAIL-handle iMessage (which has no
         // number to match) folds via the resolved contact's phone numbers. Survivor is the SMS
@@ -741,8 +780,17 @@ class IMessageTransport(
         // Reconcile the title (upgrades old "mailto:" titles / repairs a group mis-titled after a
         // sender), but don't clobber a good SMS-thread title we've folded into.
         if (groupKey != null) {
-            // The member-list title is a fallback; a group with a real name keeps it.
-            if (convo.groupName.isNullOrBlank() && convo.title != convoTitle) {
+            if (incomingGroupId != null && convo.groupId != incomingGroupId) {
+                repo.setGroupId(convo.id, incomingGroupId)
+            }
+            // Apple's own name for the group wins when it sends one. An unnamed group sends no
+            // name, which leaves any name typed here in place rather than clearing it.
+            if (cvName != null && cvName != convo.groupName) {
+                repo.setGroupName(convo.id, cvName)
+            }
+            // The member-list title is only a fallback, used until the group has a real name.
+            val named = cvName ?: convo.groupName
+            if (named.isNullOrBlank() && convo.title != convoTitle) {
                 repo.setConversationTitle(convo.id, convoTitle)
             }
             if (convo.address != groupKey) repo.setConversationAddress(convo.id, groupKey)
@@ -803,7 +851,7 @@ class IMessageTransport(
                 avatarPath = avatarStore.path(avatarKey),
                 timestamp = timestamp,
                 isGroup = isGroup,
-                groupTitle = convo.groupName?.takeIf { it.isNotBlank() } ?: convo.title,
+                groupTitle = (cvName ?: convo.groupName)?.takeIf { it.isNotBlank() } ?: convo.title,
                 muted = muted,
             )
         }
@@ -1081,5 +1129,6 @@ class IMessageTransport(
         private const val KEY_CLEANED = "cleaned_keys_v3"
         private const val KEY_REGISTERED = "imessage_registered"
         private const val KEY_GROUP_AVATARS_FIXED = "group_avatars_fixed"
+        private const val KEY_NAC_CHECKED = "nac_checked_v1"
     }
 }

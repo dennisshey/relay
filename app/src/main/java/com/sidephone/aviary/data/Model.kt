@@ -66,6 +66,12 @@ data class ConversationEntity(
      * data survives if it ever comes back.
      */
     val protocolData: String? = null,
+    /**
+     * A group's id on its own protocol — for iMessage, the `gid` a named group is matched on.
+     * Replies must carry it or they open a fresh unnamed chat on the recipients' devices, and it
+     * keeps the thread together when the member list changes.
+     */
+    val groupId: String? = null,
 )
 
 /**
@@ -171,6 +177,12 @@ interface ConversationDao {
 
     @Query("UPDATE conversations SET groupName = :groupName WHERE id = :id")
     suspend fun setGroupName(id: Long, groupName: String?)
+
+    @Query("UPDATE conversations SET groupId = :groupId WHERE id = :id")
+    suspend fun setGroupId(id: Long, groupId: String?)
+
+    @Query("SELECT * FROM conversations WHERE transportId = :transportId AND groupId = :groupId LIMIT 1")
+    suspend fun byGroupId(transportId: String, groupId: String): ConversationEntity?
 
     @Query("UPDATE conversations SET hidden = 1, hiddenAt = :at WHERE id = :id")
     suspend fun hide(id: Long, at: Long)
@@ -338,7 +350,7 @@ interface MessageDao {
 
 @Database(
     entities = [ConversationEntity::class, MessageEntity::class],
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 abstract class AviaryDatabase : RoomDatabase() {
@@ -409,6 +421,14 @@ private fun androidx.sqlite.db.SupportSQLiteDatabase.addColumnIfMissing(
         return
     }
     execSQL("ALTER TABLE `$table` ADD COLUMN `$column` $type")
+}
+
+/** v10 stores a group's protocol id (iMessage's `gid`), so replies address the named chat that
+ *  already exists rather than opening a new one. */
+val MIGRATION_9_10 = object : androidx.room.migration.Migration(9, 10) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.addColumnIfMissing("conversations", "groupId", "TEXT")
+    }
 }
 
 /** v8 stores a group's real name separately from the member-list title, so a named group keeps
