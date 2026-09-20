@@ -33,11 +33,13 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -46,6 +48,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -92,6 +95,8 @@ import com.sidephone.aviary.data.ConversationEntity
 import com.sidephone.aviary.data.MessageEntity
 import com.sidephone.aviary.data.MessageStatus
 import com.sidephone.aviary.data.Protocol
+import com.sidephone.aviary.data.isGroup
+import com.sidephone.aviary.data.displayTitle
 import com.sidephone.aviary.data.mediaLabel
 import kotlinx.coroutines.launch
 
@@ -269,6 +274,7 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
         }
     }
     var attachMenuOpen by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         topBar = {
@@ -291,7 +297,7 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                             ConversationAvatar(it, 30.dp, avatarPath)
                         }
                         Column(Modifier.padding(start = 10.dp)) {
-                            Text(convo?.title ?: "", style = MaterialTheme.typography.titleMedium)
+                            Text(convo?.displayTitle ?: "", style = MaterialTheme.typography.titleMedium)
                             Text(
                                 sendProtocol.displayName,
                                 style = MaterialTheme.typography.labelSmall,
@@ -301,6 +307,18 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                     }
                 },
                 actions = {
+                    // Name a group. iMessage carries the name a group was given, but our native
+                    // layer doesn't surface it yet, so a group shows its member list until you name
+                    // it here — and once named it keeps that name through contact and member changes.
+                    convo?.takeIf { it.isGroup }?.let { g ->
+                        IconButton(onClick = { renaming = g.groupName.orEmpty() }) {
+                            Icon(
+                                Icons.Filled.DriveFileRenameOutline,
+                                contentDescription = "Name this group",
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    }
                     // Offer "add to contacts" for an unknown phone/email 1:1 (e.g. a new number that's
                     // been texting you). Hidden once the address resolves to a saved contact.
                     val addable = convo?.takeIf {
@@ -325,6 +343,31 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
         },
         snackbarHost = { SnackbarHost(snackbar) }
     ) { padding ->
+        renaming?.let { current ->
+            var text by remember(current) { mutableStateOf(current) }
+            AlertDialog(
+                onDismissRequest = { renaming = null },
+                title = { Text("Group name") },
+                text = {
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        singleLine = true,
+                        placeholder = { Text(convo?.title ?: "") },
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val c = convo
+                        renaming = null
+                        if (c != null) scope.launch { app.repository.setGroupName(c.id, text.trim()) }
+                    }) { Text("Save") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { renaming = null }) { Text("Cancel") }
+                },
+            )
+        }
         Column(Modifier.padding(padding).fillMaxSize().imePadding()) {
             // The Delivered/Read label sits under the most recent DELIVERED/READ outgoing message,
             // so sending a new (not-yet-delivered) message leaves the old label in place until the

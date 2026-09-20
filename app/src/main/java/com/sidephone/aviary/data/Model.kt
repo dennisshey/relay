@@ -54,7 +54,32 @@ data class ConversationEntity(
     /** Transport of the most recent message — so the inbox dot shows blue after an SMS thread's
      *  last message went out over iMessage, even though the conversation itself is SMS-keyed. */
     val lastTransportId: String? = null,
+    /** A group's real name, when we know one: the name the chat carries on its own protocol, or
+     *  one the user typed here. Takes precedence over the member-list title, and unlike [title]
+     *  it is never recomputed from the member list — so a named group keeps its name when a
+     *  contact is saved, a member is added, or the next message arrives. */
+    val groupName: String? = null,
+    /**
+     * Opaque per-protocol blob carried on the row. Nothing in this source reads or writes it: the
+     * column exists on databases written by a build whose source isn't in this repo, and declaring
+     * it here is what lets Room open those databases. Preserved rather than dropped so that build's
+     * data survives if it ever comes back.
+     */
+    val protocolData: String? = null,
 )
+
+/**
+ * Group threads: Signal + group MMS are keyed "group:<id>"; an iMessage group is keyed by its
+ * ";"-joined participant list. This is the ONE definition — phone-number matching and the
+ * duplicate-thread merges must exclude groups, and an iMessage group's address is a participant
+ * list whose trailing digits look exactly like a member's phone number.
+ */
+val ConversationEntity.isGroup: Boolean
+    get() = externalId.startsWith("group:") || externalId.contains(";")
+
+/** The name to show for a conversation: a known group name wins over the member-list title. */
+val ConversationEntity.displayTitle: String
+    get() = groupName?.takeIf { it.isNotBlank() } ?: title
 
 @Entity(
     tableName = "messages",
@@ -143,6 +168,9 @@ interface ConversationDao {
 
     @Query("UPDATE conversations SET lastTransportId = :transportId WHERE id = :id")
     suspend fun setLastTransport(id: Long, transportId: String)
+
+    @Query("UPDATE conversations SET groupName = :groupName WHERE id = :id")
+    suspend fun setGroupName(id: Long, groupName: String?)
 
     @Query("UPDATE conversations SET hidden = 1, hiddenAt = :at WHERE id = :id")
     suspend fun hide(id: Long, at: Long)
@@ -239,6 +267,11 @@ interface MessageDao {
     @Query("UPDATE messages SET conversationId = :toId WHERE conversationId = :fromId")
     suspend fun reassignConversation(fromId: Long, toId: Long)
 
+    /** Move ONE message to another thread — repairs a row that was filed under the wrong
+     *  conversation (e.g. a group message swallowed into a member's 1:1 thread). */
+    @Query("UPDATE messages SET conversationId = :toId WHERE id = :id")
+    suspend fun reassignMessage(id: Long, toId: Long)
+
     @Query("DELETE FROM messages WHERE conversationId = :conversationId")
     suspend fun deleteForConversation(conversationId: Long)
 
@@ -305,7 +338,7 @@ interface MessageDao {
 
 @Database(
     entities = [ConversationEntity::class, MessageEntity::class],
-    version = 7,
+    version = 9,
     exportSchema = false
 )
 abstract class AviaryDatabase : RoomDatabase() {
@@ -350,6 +383,50 @@ val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
     override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
         db.execSQL("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
         db.execSQL("ALTER TABLE conversations ADD COLUMN hiddenAt INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+/** The columns actually present on a table right now. Migrations here are written to be
+ *  idempotent against it: this database has shipped in enough hand-built variants that a given
+ *  version number on disk isn't a reliable statement about which columns exist. */
+private fun androidx.sqlite.db.SupportSQLiteDatabase.columnsOf(table: String): Set<String> {
+    val out = HashSet<String>()
+    query("PRAGMA table_info(`$table`)").use { c ->
+        val nameCol = c.getColumnIndex("name")
+        while (c.moveToNext()) out.add(c.getString(nameCol))
+    }
+    android.util.Log.i("AviaryDb", "columns of $table: ${out.sorted()}")
+    return out
+}
+
+/** ALTER TABLE ADD COLUMN, skipped when the column is already there (SQLite has no IF NOT EXISTS
+ *  for columns, and re-adding one aborts the whole migration). */
+private fun androidx.sqlite.db.SupportSQLiteDatabase.addColumnIfMissing(
+    table: String, column: String, type: String,
+) {
+    if (column in columnsOf(table)) {
+        android.util.Log.i("AviaryDb", "$table.$column already present; skipping add")
+        return
+    }
+    execSQL("ALTER TABLE `$table` ADD COLUMN `$column` $type")
+}
+
+/** v8 stores a group's real name separately from the member-list title, so a named group keeps
+ *  its name when contacts change or a member is added. */
+val MIGRATION_7_8 = object : androidx.room.migration.Migration(7, 8) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.addColumnIfMissing("conversations", "groupName", "TEXT")
+        db.addColumnIfMissing("conversations", "protocolData", "TEXT")
+    }
+}
+
+/** v9 re-runs the v8 column add for databases already stamped v8 by an earlier build that never
+ *  added it (or added it without refreshing Room's schema hash). Idempotent, so it is a no-op on
+ *  anything that arrived here through v8 cleanly. */
+val MIGRATION_8_9 = object : androidx.room.migration.Migration(8, 9) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.addColumnIfMissing("conversations", "groupName", "TEXT")
+        db.addColumnIfMissing("conversations", "protocolData", "TEXT")
     }
 }
 

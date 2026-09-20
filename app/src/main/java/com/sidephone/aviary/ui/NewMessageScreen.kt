@@ -47,6 +47,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import com.sidephone.aviary.RelayApp
+import com.sidephone.aviary.data.displayTitle
 import com.sidephone.aviary.data.Contacts
 import com.sidephone.aviary.data.DeviceContact
 import com.sidephone.aviary.transport.instagram.InstagramApi
@@ -263,7 +264,7 @@ private fun SignalPicker(
             .sortedBy { it.second }
     }
     LazyColumn(Modifier.fillMaxSize()) {
-        items(convos, key = { "c${it.id}" }) { c -> ContactRow(c.title, null, !busy) { onOpenThread(c.id) }; Divider() }
+        items(convos, key = { "c${it.id}" }) { c -> ContactRow(c.displayTitle, null, !busy) { onOpenThread(c.id) }; Divider() }
         if (members.isNotEmpty()) item("hdr") {
             Text("From your groups", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(top = 8.dp, bottom = 2.dp))

@@ -1,6 +1,7 @@
 package com.sidephone.aviary.transport
 
 import com.sidephone.aviary.data.ConversationEntity
+import com.sidephone.aviary.data.isGroup
 import com.sidephone.aviary.transport.sms.SmsTransport
 
 /**
@@ -17,6 +18,10 @@ class MessageRouter(private val registry: TransportRegistry) {
         val home = registry.byId(conversation.transportId)
             ?: registry.byId(SmsTransport.ID)!!
         if (conversation.transportId != SmsTransport.ID) return home
+        // A group thread has no single recipient to look up: its address is a ";"-joined member
+        // list, which would be mangled into one bogus handle. Group MMS stays MMS; an iMessage
+        // group is created up front by IMessageTransport.startGroup and is already iMessage-owned.
+        if (conversation.isGroup) return home
 
         val imessage = registry.byId(IMESSAGE_ID) ?: return home
         val reachable = imessage.status.value is TransportStatus.Ready &&

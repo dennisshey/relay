@@ -30,6 +30,12 @@ class AvatarStore(context: Context) {
         pathCache.remove(key) // was possibly cached as absent; force a re-resolve
     }
 
+    /** Drop a stored avatar — e.g. a group thread that an earlier build gave one member's face. */
+    fun remove(key: String) {
+        file(key).delete()
+        pathCache.remove(key)
+    }
+
     /** Absolute path if an avatar is stored for this key, else null. Cached to avoid per-row I/O. */
     fun path(key: String): String? {
         pathCache[key]?.let { return it.ifEmpty { null } }

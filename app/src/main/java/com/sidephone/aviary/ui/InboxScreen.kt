@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.sidephone.aviary.RelayApp
+import com.sidephone.aviary.data.displayTitle
 import com.sidephone.aviary.data.ConversationEntity
 import com.sidephone.aviary.data.InboxCategory
 import com.sidephone.aviary.data.Protocol
@@ -146,7 +147,7 @@ fun InboxScreen(
             val shown = if (searching) {
                 conversations.filter {
                     it.id in contentMatches ||
-                        it.title.contains(query, true) || it.lastPreview.contains(query, true) ||
+                        it.displayTitle.contains(query, true) || it.lastPreview.contains(query, true) ||
                         it.address.contains(query, true)
                 }
             } else {
@@ -309,7 +310,7 @@ private fun ConversationRow(
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        convo.title,
+                        convo.displayTitle,
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,

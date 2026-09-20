@@ -21,15 +21,10 @@ import androidx.compose.ui.unit.Dp
 import coil.compose.AsyncImage
 import androidx.compose.runtime.remember
 import com.sidephone.aviary.data.ConversationEntity
+import com.sidephone.aviary.data.displayTitle
+import com.sidephone.aviary.data.isGroup
 import java.io.File
 import kotlin.math.absoluteValue
-
-/**
- * Group threads: Signal + group MMS are keyed "group:<id>"; an iMessage group is keyed by its
- * ";"-joined participant list. Drives the group avatar and the per-sender name labels on bubbles.
- */
-val ConversationEntity.isGroup: Boolean
-    get() = externalId.startsWith("group:") || externalId.contains(";")
 
 private val AvatarPalette = listOf(
     Color(0xFF3B82F6), Color(0xFF8B5CF6), Color(0xFFEC4899), Color(0xFFF97316),
@@ -62,7 +57,7 @@ fun ConversationAvatar(convo: ConversationEntity, size: Dp, avatarPath: String? 
             convo.isGroup ->
                 Icon(Icons.Filled.Groups, null, tint = Color.White, modifier = Modifier.size(size * 0.58f))
             else -> Text(
-                convo.title.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?",
+                convo.displayTitle.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?",
                 color = Color.White, fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.titleMedium,
             )

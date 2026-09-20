@@ -45,8 +45,11 @@ class AviaryProtocolStore(
     init {
         // Re-seed memory from disk without re-persisting (call super, not our overrides).
         for ((key, value) in prefs.all) {
-            val bytes = Base64.decode(value as String, Base64.NO_WRAP)
+            // Decode inside the guard: this store shares its prefs file, and one entry that isn't
+            // a base-64 record (or isn't a String at all) used to throw straight out of the
+            // constructor and take the whole app down at launch. Skip the row, keep the rest.
             runCatching {
+                val bytes = Base64.decode(value as String, Base64.NO_WRAP)
                 when {
                     key.startsWith(PRE) ->
                         super.storePreKey(key.idAfter(PRE), PreKeyRecord(bytes))

@@ -265,14 +265,53 @@ class IMessageTransport(
     }
 
     /** Our own registered iMessage handles (emails), lowercased without scheme — so we can drop
-     *  ourselves from a group's recipient list and member-name title. */
+     *  ourselves from a group's recipient list and member-name title. Includes this device's own
+     *  phone number: a group created on an iPhone often lists us by BOTH email and number, and our
+     *  number never registers on iMessage (Mac-class validation data), so it isn't in nativeHandles
+     *  — leaving us counted as a member of our own group and addressed on every send. */
     private val selfHandles: Set<String> by lazy {
-        runCatching {
-            val arr = json(ImessageNative.nativeHandles()).optJSONArray("handles")
-            buildSet {
+        buildSet {
+            runCatching {
+                val arr = json(ImessageNative.nativeHandles()).optJSONArray("handles")
                 if (arr != null) for (i in 0 until arr.length()) add(cleanHandle(arr.getString(i)).lowercase())
             }
-        }.getOrDefault(emptySet())
+            addAll(selfNumbers())
+        }
+    }
+
+    /** Last-10-digit key for a phone number, so formatting/country-code differences collapse. */
+    private fun numKey(addr: String): String = addr.filter { it.isDigit() }.takeLast(10)
+
+    /** This device's own numbers, in every form a handle might take, for [selfHandles]. */
+    private fun selfNumbers(): Set<String> {
+        val raw = buildSet {
+            runCatching {
+                context.getSystemService(android.telephony.TelephonyManager::class.java)
+                    ?.line1Number?.let { add(it) }
+            }
+            runCatching {
+                @Suppress("MissingPermission")
+                context.getSystemService(android.telephony.SubscriptionManager::class.java)
+                    ?.activeSubscriptionInfoList?.forEach { info -> info.number?.let { add(it) } }
+            }
+        }
+        return buildSet {
+            for (n in raw) {
+                val key = numKey(n)
+                if (key.length < 10) continue
+                add(cleanHandle(imessageHandle(key)).lowercase())
+            }
+        }
+    }
+
+    /** True if [handle] is one of ours — matched on the last 10 digits for numbers, so a
+     *  "+1555…" participant still matches a "555…" line1Number. */
+    private fun isSelfHandle(handle: String): Boolean {
+        val clean = cleanHandle(handle).lowercase()
+        if (clean in selfHandles) return true
+        if (clean.contains("@")) return false // an email with digits in it is not a phone number
+        val key = numKey(clean)
+        return key.length == 10 && selfHandles.any { numKey(it) == key }
     }
 
     /** Recipient list for a send. A group thread (externalId is a ";"-joined participant list) sends
@@ -282,7 +321,7 @@ class IMessageTransport(
         val handles = if (convo.externalId.contains(";")) {
             convo.externalId.split(";").map { it.trim() }.filter { it.isNotEmpty() }
                 .map { imessageHandle(it) }
-                .filterNot { cleanHandle(it).lowercase() in selfHandles }
+                .filterNot { isSelfHandle(it) }
                 .ifEmpty { convo.externalId.split(";").filter { it.isNotBlank() }.map { imessageHandle(it.trim()) } }
         } else listOf(imessageHandle(convo.address))
         return JSONArray().apply { handles.distinct().forEach { put(it) } }.toString()
@@ -295,7 +334,7 @@ class IMessageTransport(
     private fun canonicalGroupKey(chat: String): String =
         chat.split(";").map { it.trim() }.filter { it.isNotEmpty() }
             .map { imessageHandle(it).lowercase() }
-            .filterNot { cleanHandle(it) in selfHandles }
+            .filterNot { isSelfHandle(it) }
             .distinct().sorted().joinToString(";")
 
     /** Start (or reopen) an iMessage group with [addresses]. Fails unless every member is reachable
@@ -317,7 +356,7 @@ class IMessageTransport(
     /** A group's display title from its members' names (we're excluded), e.g. "Alice, Bob +2". */
     private fun groupTitleFor(chat: String): String {
         val members = chat.split(";").map { it.trim() }
-            .filter { it.isNotEmpty() && cleanHandle(it).lowercase() !in selfHandles }
+            .filter { it.isNotEmpty() && !isSelfHandle(it) }
         val names = members.map { resolveContact(it).first ?: cleanHandle(it) }
         return when {
             names.isEmpty() -> "Group"
@@ -543,6 +582,10 @@ class IMessageTransport(
             // Clean the leftover object-replacement glyph from old attachment captions.
             runCatching { repo.stripPlaceholderChars() }
                 .onFailure { Log.w(TAG, "strip placeholder chars failed", it) }
+            // One-time repair: drop the contact photo earlier builds saved as a group thread's
+            // avatar (it was the first participant's face, and the store is write-once).
+            runCatching { dropGroupMemberAvatars() }
+                .onFailure { Log.w(TAG, "drop group avatars failed", it) }
             // Fill in names/photos for contacts saved after a thread was created, and keep them
             // in sync as the address book changes.
             runCatching { refreshContacts() }.onFailure { Log.w(TAG, "refresh contacts failed", it) }
@@ -581,8 +624,10 @@ class IMessageTransport(
         if (msg.has("typing")) {
             val chat = msg.optString("chat").ifBlank { return }
             val address = chat.substringBefore(";")
-            val convoKey = if (!chat.contains(";"))
-                (resolveContact(address).third?.let { "imc:$it" } ?: chat) else chat
+            // Groups key by the CANONICAL participant set, exactly as handleIncoming does — the raw
+            // chat string isn't lowercased or self-filtered, so it matched no thread.
+            val convoKey = if (chat.contains(";")) canonicalGroupKey(chat)
+                else (resolveContact(address).third?.let { "imc:$it" } ?: chat)
             repo.conversationByExternal(id, convoKey)?.let { c ->
                 (context.applicationContext as? com.sidephone.aviary.RelayApp)
                     ?.typing?.set(c.id, msg.optBoolean("typing"))
@@ -696,13 +741,28 @@ class IMessageTransport(
         // Reconcile the title (upgrades old "mailto:" titles / repairs a group mis-titled after a
         // sender), but don't clobber a good SMS-thread title we've folded into.
         if (groupKey != null) {
-            if (convo.title != convoTitle) repo.setConversationTitle(convo.id, convoTitle)
+            // The member-list title is a fallback; a group with a real name keeps it.
+            if (convo.groupName.isNullOrBlank() && convo.title != convoTitle) {
+                repo.setConversationTitle(convo.id, convoTitle)
+            }
             if (convo.address != groupKey) repo.setConversationAddress(convo.id, groupKey)
         } else if (folded == null && convo.title != desiredTitle) {
             repo.setConversationTitle(convo.id, desiredTitle)
         }
         val avatarKey = convo.externalId
-        if (photo != null && !avatarStore.has(avatarKey)) avatarStore.save(avatarKey, photo)
+        // Only a 1:1 thread takes the contact's photo. `photo` belongs to the FIRST participant, so
+        // saving it on a group made the whole group wear one member's face (and it stuck, because
+        // the store is write-once).
+        if (groupKey == null && photo != null && !avatarStore.has(avatarKey)) {
+            avatarStore.save(avatarKey, photo)
+        }
+        // Repair: an earlier build's phone-number merge moved group messages into a member's 1:1
+        // thread. Apple re-delivers cached messages on each reconnect, so when one comes back and
+        // we find its row sitting somewhere else, move it home. recordMessage below then no-ops on
+        // the duplicate, so nothing is counted or notified twice.
+        if (groupKey != null && guid != null && repo.relocateMessage(id, guid, convo.id)) {
+            Log.i(TAG, "relocated $guid into group thread ${convo.id} ('$groupKey')")
+        }
         val replyTo = msg.optStringOrNull("reply_to")
         val replyPreview = replyTo?.let { repo.bodyForExternal(id, it) }
         // Attachment downloaded by the native poll (MMCS), if any.
@@ -743,7 +803,7 @@ class IMessageTransport(
                 avatarPath = avatarStore.path(avatarKey),
                 timestamp = timestamp,
                 isGroup = isGroup,
-                groupTitle = convo.title,
+                groupTitle = convo.groupName?.takeIf { it.isNotBlank() } ?: convo.title,
                 muted = muted,
             )
         }
@@ -897,7 +957,8 @@ class IMessageTransport(
                 // builds, and refresh member names as contacts are saved. The member list lives in
                 // the externalId, so we can fix it without waiting for the next message.
                 val title = groupTitleFor(c.externalId)
-                if (c.title != title) repo.setConversationTitle(c.id, title)
+                // Only the member-list fallback is refreshed; a named group keeps its name.
+                if (c.groupName.isNullOrBlank() && c.title != title) repo.setConversationTitle(c.id, title)
                 if (c.address != c.externalId) repo.setConversationAddress(c.id, c.externalId)
                 // Cache every member's name so messages ALREADY in the thread label by name rather
                 // than a raw handle — otherwise old bubbles stay numeric until that person writes.
@@ -928,6 +989,19 @@ class IMessageTransport(
             )
             contactsObserver = obs
         }
+    }
+
+    /** Clear avatars wrongly stored for group threads. A group's picture should be the group
+     *  glyph, not whichever member happened to be first in the participant list. */
+    private suspend fun dropGroupMemberAvatars() = withContext(Dispatchers.IO) {
+        if (prefs.getBoolean(KEY_GROUP_AVATARS_FIXED, false)) return@withContext
+        for (c in repo.conversationsForTransport(id)) {
+            if (c.externalId.contains(";") && avatarStore.has(c.externalId)) {
+                Log.i(TAG, "dropping member avatar on group thread ${c.id}")
+                avatarStore.remove(c.externalId)
+            }
+        }
+        prefs.edit().putBoolean(KEY_GROUP_AVATARS_FIXED, true).apply()
     }
 
     private suspend fun mergeDuplicateContactThreads() {
@@ -1006,5 +1080,6 @@ class IMessageTransport(
         private const val KEY_CONFIG = "mac_config"
         private const val KEY_CLEANED = "cleaned_keys_v3"
         private const val KEY_REGISTERED = "imessage_registered"
+        private const val KEY_GROUP_AVATARS_FIXED = "group_avatars_fixed"
     }
 }

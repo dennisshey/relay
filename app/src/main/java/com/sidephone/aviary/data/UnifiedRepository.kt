@@ -27,8 +27,7 @@ class UnifiedRepository(private val db: AviaryDatabase) {
         val key = number.filter { it.isDigit() }.takeLast(10)
         if (key.length < 7) return null
         return db.conversations().allList().firstOrNull {
-            !it.externalId.startsWith("group:") &&
-                it.address.filter { c -> c.isDigit() }.takeLast(10) == key
+            !it.isGroup && it.address.filter { c -> c.isDigit() }.takeLast(10) == key
         }
     }
 
@@ -61,6 +60,30 @@ class UnifiedRepository(private val db: AviaryDatabase) {
 
     suspend fun setConversationTitle(id: Long, title: String) =
         db.conversations().setTitle(id, title)
+
+    /** Set (or clear, with null) a group's real name — shown instead of the member-list title. */
+    suspend fun setGroupName(id: Long, groupName: String?) =
+        db.conversations().setGroupName(id, groupName?.takeIf { it.isNotBlank() })
+
+    /**
+     * Move a single already-stored message into [conversationId]. Repairs rows filed under the
+     * wrong thread — a group message that an earlier build's phone-number merge swallowed into a
+     * member's 1:1 thread lands back in the group when Apple re-delivers it. Returns true if the
+     * message moved.
+     */
+    suspend fun relocateMessage(transportId: String, externalId: String, conversationId: Long): Boolean {
+        val m = db.messages().getByExternal(transportId, externalId) ?: return false
+        if (m.conversationId == conversationId) return false
+        db.messages().reassignMessage(m.id, conversationId)
+        // recordMessage will no-op on the duplicate insert, so carry the preview/timestamp over
+        // here — otherwise a repaired thread sits on a stale preview until its next new message.
+        val target = db.conversations().get(conversationId)
+        if (target != null && m.timestamp >= target.lastMessageAt) {
+            val preview = m.body.ifBlank { mediaLabel(m.mediaType) }
+            db.conversations().touch(conversationId, m.timestamp, preview.take(120), 0)
+        }
+        return true
+    }
 
     suspend fun setConversationAddress(id: Long, address: String) =
         db.conversations().setAddress(id, address)
@@ -118,7 +141,12 @@ class UnifiedRepository(private val db: AviaryDatabase) {
      * back to it, keeping the conversation unified going forward.
      */
     suspend fun mergePhoneDuplicates() {
-        val convos = db.conversations().allList().filter { !it.externalId.startsWith("group:") }
+        // Groups are excluded via [isGroup], not a "group:" prefix test: an iMessage group is keyed
+        // by its ";"-joined participant list, so its address ENDS in a member's phone number. A
+        // prefix-only test let every such group match that member's 1:1 thread and get merged into
+        // it — the group's messages moved into the 1:1 and the group row was deleted, on every
+        // launch. Two groups sharing a trailing member collapsed together the same way.
+        val convos = db.conversations().allList().filter { !it.isGroup }
         val byNumber = LinkedHashMap<String, MutableList<ConversationEntity>>()
         for (c in convos) {
             val key = c.address.filter { it.isDigit() }.takeLast(10)
