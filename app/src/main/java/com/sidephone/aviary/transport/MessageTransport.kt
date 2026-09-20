@@ -72,6 +72,12 @@ interface MessageTransport {
     /** Tell the other side we're typing (or stopped). Best-effort; failures are ignored. */
     suspend fun sendTyping(conversation: ConversationEntity, isTyping: Boolean) {}
 
+    /** Whether this transport can edit a sent message — drives the thread's Edit action. */
+    val supportsEditing: Boolean get() = false
+
+    /** Whether this transport can retract a sent message for everyone. */
+    val supportsUnsend: Boolean get() = false
+
     /** Edit a previously-sent message to [newBody]. */
     suspend fun editMessage(
         conversation: ConversationEntity, message: MessageEntity, newBody: String,

@@ -446,6 +446,9 @@ class IMessageTransport(
         }
     }
 
+    override val supportsEditing: Boolean get() = true
+    override val supportsUnsend: Boolean get() = true
+
     override suspend fun editMessage(
         conversation: ConversationEntity, message: MessageEntity, newBody: String,
     ): Result<Unit> = withContext(Dispatchers.IO) {

@@ -42,6 +42,7 @@ class RelayApp : Application(), coil.ImageLoaderFactory {
                 com.sidephone.aviary.data.MIGRATION_7_8,
                 com.sidephone.aviary.data.MIGRATION_8_9,
                 com.sidephone.aviary.data.MIGRATION_9_10,
+                com.sidephone.aviary.data.MIGRATION_10_11,
             )
             .build()
     }

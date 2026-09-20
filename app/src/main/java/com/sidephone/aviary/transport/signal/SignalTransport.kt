@@ -208,6 +208,39 @@ class SignalTransport(
         }
     }
 
+    override val supportsEditing: Boolean get() = true
+
+    /**
+     * Replace the body of a message we already sent. Signal keeps the original's timestamp as the
+     * thread's anchor (quotes and reactions still point at it) and the edit carries its own, so
+     * the stored row keeps its externalId and only its body changes.
+     */
+    override suspend fun editMessage(
+        conversation: ConversationEntity, message: MessageEntity, newBody: String,
+    ): Result<Unit> {
+        if (!account.isRegistered) return Result.failure(IllegalStateException("Link Signal first"))
+        if (!message.outgoing) return Result.failure(IllegalStateException("can only edit your own messages"))
+        val externalId = message.externalId
+            ?: return Result.failure(IllegalStateException("message not sent yet"))
+        val body = newBody.trim()
+        if (body.isEmpty()) return Result.failure(IllegalStateException("an edit can't be empty"))
+        val ts = System.currentTimeMillis()
+        return withContext(Dispatchers.IO) {
+            val sender = SignalSender(store, account, SignalTrust.okHttpClient(context))
+            val r = if (conversation.externalId.startsWith("group:")) {
+                val masterKey = Base64.decode(conversation.externalId.removePrefix("group:"), Base64.NO_WRAP)
+                val group = SignalGroups(SignalTrust.okHttpClient(context))
+                    .fetch(account.authToken(), account.aci!!, account.pni!!, masterKey)
+                if (group.memberAcis.isEmpty()) Result.failure(IllegalStateException("Couldn't load group members"))
+                else sender.sendEditGroup(masterKey, group, message.timestamp, body, ts)
+            } else {
+                sender.sendEditDirect(conversation.externalId, message.timestamp, body, ts)
+            }
+            if (r.isSuccess) repo.editMessageByExternal(ID, externalId, body)
+            r
+        }
+    }
+
     override suspend fun sendReaction(
         conversation: ConversationEntity, message: MessageEntity, emoji: String, add: Boolean,
     ): Result<Unit> {

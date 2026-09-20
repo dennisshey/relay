@@ -47,6 +47,40 @@ class SignalSender(
             syncSent(dataMessage, ts, recipientAci)
         }
 
+    /**
+     * Edit an already-sent 1:1 message. Signal models an edit as a whole replacement DataMessage
+     * carrying its OWN new timestamp, wrapped in an EditMessage that points at the original's
+     * sent timestamp — the recipient swaps the body in place and marks the bubble edited.
+     * Signal only accepts edits for about 24 hours after the original.
+     */
+    fun sendEditDirect(
+        recipientAci: String, targetTimestamp: Long, body: String, ts: Long,
+    ): Result<Unit> =
+        runCatching {
+            val edit = editMessage(targetTimestamp, dataMessage(body, ts, null))
+            sendContent(recipientAci, contentEdit(edit), ts, null).getOrThrow()
+            syncSentEdit(edit, ts, recipientAci)
+        }
+
+    /** Edit an already-sent group message, fanned out to every member. */
+    fun sendEditGroup(
+        masterKey: ByteArray, group: SignalGroups.Info, targetTimestamp: Long, body: String, ts: Long,
+    ): Result<Unit> =
+        runCatching {
+            val groupContext = MiniProto.Writer().bytes(1, masterKey)
+                .varint(2, group.revision.toLong()).toByteArray()
+            val edit = editMessage(targetTimestamp, dataMessage(body, ts, groupContext))
+            val padded = contentEdit(edit)
+            var anySent = false
+            group.memberAcis.filter { it != account.aci }.forEach { member ->
+                sendContent(member, padded, ts, null)
+                    .onSuccess { anySent = true }
+                    .onFailure { Log.w(TAG, "group edit to $member failed: ${it.message}") }
+            }
+            check(anySent) { "could not deliver the edit to any group member" }
+            syncSentEdit(edit, ts, null)
+        }
+
     /** Send a group message to every member with the given timestamp. */
     fun sendGroup(
         masterKey: ByteArray, group: SignalGroups.Info, body: String, ts: Long, quote: Quote? = null,
@@ -320,6 +354,29 @@ class SignalSender(
     /** Content.dataMessage = 1, padded and tagged with its timestamp for the send call. */
     private fun content(dataMessage: ByteArray): ByteArray =
         pad(MiniProto.Writer().bytes(1, dataMessage).toByteArray())
+
+    /** EditMessage: targetSentTimestamp(1) = the message being replaced, dataMessage(2) = the
+     *  replacement in full. */
+    private fun editMessage(targetTimestamp: Long, dataMessage: ByteArray): ByteArray =
+        MiniProto.Writer().varint(1, targetTimestamp).bytes(2, dataMessage).toByteArray()
+
+    /** Content.editMessage = 11. It shares a oneof with dataMessage, so an edit is sent INSTEAD
+     *  of a data message, never alongside one. */
+    private fun contentEdit(edit: ByteArray): ByteArray =
+        pad(MiniProto.Writer().bytes(11, edit).toByteArray())
+
+    /** Mirror an edit to our own other devices: SyncMessage.Sent.editMessage = 10, alongside the
+     *  same timestamp/destination the original transcript used. */
+    private fun syncSentEdit(edit: ByteArray, timestamp: Long, destinationAci: String?) {
+        val ourAci = account.aci ?: return
+        val sent = MiniProto.Writer().varint(2, timestamp).bytes(10, edit)
+            .also { if (destinationAci != null) it.string(7, destinationAci) }
+            .toByteArray()
+        val sync = MiniProto.Writer().bytes(1, sent).toByteArray()      // SyncMessage.sent = 1
+        val content = MiniProto.Writer().bytes(2, sync).toByteArray()   // Content.syncMessage = 2
+        runCatching { sendContent(ourAci, pad(content), timestamp, account.deviceId).getOrThrow() }
+            .onFailure { Log.w(TAG, "edit sent-sync failed: ${it.message}") }
+    }
 
     private fun fetchPreKeys(aci: String): JSONObject {
         val request = Request.Builder()

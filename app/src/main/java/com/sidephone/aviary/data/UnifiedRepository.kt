@@ -297,6 +297,30 @@ class UnifiedRepository(private val db: AviaryDatabase) {
             db.messages().setStatusByExternal(transportId, externalId, status)
     }
 
+    /**
+     * The preview for [url], fetching it once if we haven't already. Returns null when the link
+     * has nothing to show. The fetch reaches the linked site, so callers should only ask for
+     * links the user is actually looking at.
+     */
+    suspend fun linkPreview(url: String): LinkPreviewEntity? {
+        db.linkPreviews().get(url)?.let { return if (it.failed) null else it }
+        val fetched = LinkPreviews.fetch(url)
+        val row = if (fetched == null || fetched.isEmpty) {
+            LinkPreviewEntity(url = url, fetchedAt = System.currentTimeMillis(), failed = true)
+        } else {
+            LinkPreviewEntity(
+                url = url,
+                title = fetched.title,
+                description = fetched.description,
+                imageUrl = fetched.imageUrl,
+                siteName = fetched.siteName,
+                fetchedAt = System.currentTimeMillis(),
+            )
+        }
+        db.linkPreviews().put(row)
+        return row.takeIf { !it.failed }
+    }
+
     suspend fun knownExternalIds(transportId: String): Set<String> =
         db.messages().knownExternalIds(transportId).toSet()
 }

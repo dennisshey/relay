@@ -119,6 +119,31 @@ data class MessageEntity(
     val replyToPreview: String? = null,
 )
 
+/**
+ * A cached link preview, keyed by the URL itself so the same link shared in several threads is
+ * only ever fetched once. [failed] records a page that had nothing to show, so a dead or
+ * card-less link isn't re-requested every time the thread is scrolled.
+ */
+@Entity(tableName = "link_previews")
+data class LinkPreviewEntity(
+    @PrimaryKey val url: String,
+    val title: String? = null,
+    val description: String? = null,
+    val imageUrl: String? = null,
+    val siteName: String? = null,
+    val fetchedAt: Long = 0,
+    val failed: Boolean = false,
+)
+
+@Dao
+interface LinkPreviewDao {
+    @Query("SELECT * FROM link_previews WHERE url = :url")
+    suspend fun get(url: String): LinkPreviewEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun put(preview: LinkPreviewEntity)
+}
+
 @Dao
 interface ConversationDao {
     @Query("SELECT * FROM conversations WHERE hidden = 0 ORDER BY lastMessageAt DESC")
@@ -349,13 +374,14 @@ interface MessageDao {
 }
 
 @Database(
-    entities = [ConversationEntity::class, MessageEntity::class],
-    version = 10,
+    entities = [ConversationEntity::class, MessageEntity::class, LinkPreviewEntity::class],
+    version = 11,
     exportSchema = false
 )
 abstract class AviaryDatabase : RoomDatabase() {
     abstract fun conversations(): ConversationDao
     abstract fun messages(): MessageDao
+    abstract fun linkPreviews(): LinkPreviewDao
 }
 
 /** v2 adds attachment columns to messages. */
@@ -421,6 +447,18 @@ private fun androidx.sqlite.db.SupportSQLiteDatabase.addColumnIfMissing(
         return
     }
     execSQL("ALTER TABLE `$table` ADD COLUMN `$column` $type")
+}
+
+/** v11 adds the link-preview cache. */
+val MIGRATION_10_11 = object : androidx.room.migration.Migration(10, 11) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `link_previews` (" +
+                "`url` TEXT NOT NULL, `title` TEXT, `description` TEXT, `imageUrl` TEXT, " +
+                "`siteName` TEXT, `fetchedAt` INTEGER NOT NULL, `failed` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`url`))"
+        )
+    }
 }
 
 /** v10 stores a group's protocol id (iMessage's `gid`), so replies address the named chat that

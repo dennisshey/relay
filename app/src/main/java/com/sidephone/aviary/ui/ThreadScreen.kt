@@ -450,8 +450,12 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                             } else null,
                             replyToSender = replyToSender,
                             quotedIsMine = quotedIsMine,
-                            canEditUnsend = msg.outgoing && msg.externalId != null &&
-                                msg.transportId == "imessage",
+                            // Ask the transport rather than naming one: iMessage does both,
+                            // Signal edits but has no retract here yet.
+                            canEdit = msg.outgoing && msg.externalId != null &&
+                                app.transports.byId(msg.transportId)?.supportsEditing == true,
+                            canUnsend = msg.outgoing && msg.externalId != null &&
+                                app.transports.byId(msg.transportId)?.supportsUnsend == true,
                             onEdit = { editingMessage = msg; replyingTo = null; draft = msg.body },
                             onUnsend = {
                                 scope.launch {
@@ -774,6 +778,86 @@ private fun addToContacts(context: android.content.Context, address: String) {
     runCatching { context.startActivity(intent) }
 }
 
+/**
+ * Shows what the first link in [body] says about itself. The lookup is cached by URL and only
+ * happens when the bubble is actually composed, so a link is fetched once and only for messages
+ * the user has scrolled to — never in the background as messages arrive.
+ */
+@Composable
+private fun LinkPreviewCard(body: String, outgoing: Boolean) {
+    val url = remember(body) { com.sidephone.aviary.data.LinkPreviews.firstUrl(body) } ?: return
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val app = ctx.applicationContext as? RelayApp ?: return
+    val preview by produceState<com.sidephone.aviary.data.LinkPreviewEntity?>(null, url) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { app.repository.linkPreview(url) }.getOrNull()
+        }
+    }
+    val p = preview ?: return
+    val onTint = if (outgoing) Color.White else MaterialTheme.colorScheme.onSecondaryContainer
+
+    Column(
+        Modifier
+            .padding(top = 6.dp)
+            .widthIn(max = 260.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                if (outgoing) Color.White.copy(alpha = 0.16f)
+                else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
+            )
+            .clickable { openUrl(ctx, url) }
+    ) {
+        p.imageUrl?.let { image ->
+            coil.compose.AsyncImage(
+                model = image,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth().height(130.dp),
+            )
+        }
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            p.siteName?.let {
+                Text(
+                    it,
+                    color = onTint.copy(alpha = 0.65f),
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            p.title?.let {
+                Text(
+                    it,
+                    color = onTint,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            p.description?.let {
+                Text(
+                    it,
+                    color = onTint.copy(alpha = 0.8f),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+    }
+}
+
+private fun openUrl(ctx: android.content.Context, url: String) {
+    runCatching {
+        ctx.startActivity(
+            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+}
+
 /** iMessage look: colored bubble by protocol for outgoing, gray for incoming. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -793,7 +877,8 @@ private fun MessageBubble(
     onReact: (String) -> Unit = {},
     onEdit: () -> Unit = {},
     onUnsend: () -> Unit = {},
-    canEditUnsend: Boolean = false,
+    canEdit: Boolean = false,
+    canUnsend: Boolean = false,
     topSpacing: androidx.compose.ui.unit.Dp = 0.dp,
 ) {
     val clipboard = LocalClipboardManager.current
@@ -959,6 +1044,12 @@ private fun MessageBubble(
                                 modifier = if (msg.mediaPath != null) Modifier.padding(top = 6.dp) else Modifier,
                             )
                         }
+                        // A card for the first link in the message, if the page says anything
+                        // about itself. Only for messages with no attachment of their own — a
+                        // photo already fills the bubble.
+                        if (msg.mediaPath == null && msg.mediaUrl == null) {
+                            LinkPreviewCard(msg.body, msg.outgoing)
+                        }
                     }
                 }
             }
@@ -1010,13 +1101,13 @@ private fun MessageBubble(
                         onClick = { menuOpen = false; onRetry() },
                     )
                 }
-                if (canEditUnsend && msg.body.isNotBlank()) {
+                if (canEdit && msg.body.isNotBlank()) {
                     DropdownMenuItem(
                         text = { Text("Edit") },
                         onClick = { menuOpen = false; onEdit() },
                     )
                 }
-                if (canEditUnsend) {
+                if (canUnsend) {
                     DropdownMenuItem(
                         text = { Text("Unsend") },
                         onClick = { menuOpen = false; onUnsend() },

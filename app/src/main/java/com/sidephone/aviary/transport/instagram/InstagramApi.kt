@@ -254,13 +254,77 @@ class InstagramApi(
     // ---- direct messages ---------------------------------------------------
 
     /** One inbox thread with its most recent items, as raw JSON for the receiver to map. */
-    fun fetchInbox(): JSONObject? {
+    /**
+     * The DM inbox. Instagram splits DMs across folders: the default is Primary, [folder] 1 is
+     * General. A thread sitting in General is a perfectly ordinary conversation — it just never
+     * appears in the default response, so polling only the default silently loses those messages.
+     */
+    /**
+     * The DM inbox for a folder. Instagram is picky about the query it will accept here and
+     * changes its mind over time: the long-standing form started answering HTTP 404 (with a
+     * nonsense `item_ack` body) for the default folder while the very same query with an
+     * explicit folder worked. Rather than pin one spelling, try the known-good shapes in order
+     * and keep the first that actually yields threads — a 404 on the primary inbox means no
+     * messages arrive at all, which is not worth a brittle URL.
+     */
+    fun fetchInbox(folder: Int? = null): JSONObject? {
+        val label = if (folder == null) "primary" else "folder$folder"
+        val f = folder ?: 0
+        val candidates = listOf(
+            "?visual_message_return_type=unseen&thread_message_limit=10&persistentBadging=true&limit=20&folder=$f",
+            "?visual_message_return_type=unseen&thread_message_limit=10&persistentBadging=true&limit=20" +
+                folder?.let { "&folder=$it" }.orEmpty(),
+            "?thread_message_limit=10&limit=20&folder=$f",
+            "?persistentBadging=true&folder=$f",
+        )
+        for ((i, q) in candidates.withIndex()) {
+            val json = inboxRequest("$base/direct_v2/inbox/$q", label, quiet = i < candidates.lastIndex)
+            if (json?.optJSONObject("inbox")?.optJSONArray("threads") != null) {
+                if (i > 0) Log.i(TAG, "inbox[$label]: query #$i is the one this account accepts")
+                return json
+            }
+        }
+        return null
+    }
+
+    /**
+     * One thread's recent history, by id. The inbox listing can fail server-side (this account
+     * has seen the default folder answer a flat HTTP 404 for days while every other call
+     * succeeds), and when it does this is the only way to keep already-known conversations
+     * receiving. Returns the thread object, shaped like the ones inside an inbox response.
+     */
+    fun fetchThread(threadId: String): JSONObject? {
         val req = Request.Builder()
-            .url("$base/direct_v2/inbox/?visual_message_return_type=unseen&thread_message_limit=10&persistentBadging=true&limit=20")
+            .url("$base/direct_v2/threads/$threadId/?visual_message_return_type=unseen&limit=20")
             .get().commonHeaders().build()
         http.newCall(req).execute().use { resp ->
             capture(resp)
-            return runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull()
+            val json = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull()
+            return json?.optJSONObject("thread")
+        }
+    }
+
+    /** Message requests — threads from people the account hasn't accepted yet. */
+    fun fetchPendingInbox(): JSONObject? = inboxRequest(
+        "$base/direct_v2/pending_inbox/?visual_message_return_type=unseen&thread_message_limit=10&persistentBadging=true&limit=20",
+        "pending",
+    )
+
+    /**
+     * One inbox GET. A failure here used to return null and say nothing, so a session Instagram
+     * had quietly invalidated looked identical to an empty inbox — messages simply stopped
+     * arriving with no indication why. Report what came back instead.
+     */
+    private fun inboxRequest(url: String, label: String, quiet: Boolean = false): JSONObject? {
+        val req = Request.Builder().url(url).get().commonHeaders().build()
+        http.newCall(req).execute().use { resp ->
+            capture(resp)
+            val text = resp.body?.string().orEmpty()
+            val json = runCatching { JSONObject(text) }.getOrNull()
+            if (!quiet && json?.optJSONObject("inbox")?.optJSONArray("threads") == null) {
+                Log.w(TAG, "inbox[$label] unusable: HTTP ${resp.code} ${text.take(300)}")
+            }
+            return json
         }
     }
 

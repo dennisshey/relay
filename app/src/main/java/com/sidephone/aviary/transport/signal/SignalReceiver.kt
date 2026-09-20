@@ -292,6 +292,11 @@ class SignalReceiver(
             // SyncMessage.sent (1): a message we sent from the phone — mirror it here.
             MiniProto.bytesField(syncProto, 1)?.let { sent ->
                 val sentProto = MiniProto.parse(sent)
+                // Sent.editMessage (10): we edited one of our own messages on another device.
+                MiniProto.bytesField(sentProto, 10)?.let { editBytes ->
+                    applyEdit(editBytes, authorAci = account.aci)
+                    return
+                }
                 val dm = MiniProto.bytesField(sentProto, 3) ?: return // Sent.message (DataMessage)
                 // Sent.destinationServiceId — its field number has shifted across proto versions
                 // (field 7 is now storyMessage), so take field 12 if it's a UUID, else the one
@@ -324,8 +329,31 @@ class SignalReceiver(
             return
         }
 
+        // Content.editMessage (11): the sender replaced the body of one of their earlier
+        // messages. It shares a oneof with dataMessage, so it arrives instead of one.
+        MiniProto.bytesField(contentProto, 11)?.let { editBytes ->
+            applyEdit(editBytes, authorAci = senderAci)
+            return
+        }
+
         val dataMessage = MiniProto.bytesField(contentProto, 1) ?: return // Content.dataMessage
         processDataMessage(dataMessage, senderAci, senderE164, false, null, serverTimestamp)
+    }
+
+    /**
+     * Apply an EditMessage: targetSentTimestamp(1) names the message being replaced and
+     * dataMessage(2) carries the replacement in full. The original keeps its timestamp — it is
+     * what quotes and reactions point at — so only the body changes.
+     */
+    private suspend fun applyEdit(editBytes: ByteArray, authorAci: String?) {
+        val edit = MiniProto.parse(editBytes)
+        val targetTs = MiniProto.varintField(edit, 1) ?: return
+        val newBody = MiniProto.bytesField(edit, 2)
+            ?.let { MiniProto.stringField(MiniProto.parse(it), 1) } ?: return
+        val externalId =
+            if (authorAci != null && authorAci == account.aci) "out:$targetTs"
+            else "$authorAci:$targetTs"
+        repo.editMessageByExternal(SignalTransport.ID, externalId, newBody)
     }
 
     /**

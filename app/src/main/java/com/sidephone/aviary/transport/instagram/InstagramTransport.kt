@@ -133,14 +133,51 @@ class InstagramTransport(
         }
     }
 
+    /**
+     * Instagram keeps DMs in more than one place, and only the default one comes back from a
+     * plain inbox fetch. A thread the account has filed under General reads as an ordinary
+     * conversation but is invisible to that request, which is why messages seemed to arrive
+     * only sometimes. Pending threads (people not accepted yet) land in the secondary inbox,
+     * matching how Instagram itself keeps requests out of your notifications.
+     */
     private suspend fun syncInbox() {
-        val inbox = api.fetchInbox()?.optJSONObject("inbox") ?: return
-        val threads = inbox.optJSONArray("threads") ?: return
-        val me = account.userId
+        val primary = api.fetchInbox()?.optJSONObject("inbox")
+        syncThreads(primary, InboxCategory.PRIMARY, "primary")
+        syncThreads(api.fetchInbox(folder = 1)?.optJSONObject("inbox"), InboxCategory.PRIMARY, "general")
+        syncThreads(api.fetchPendingInbox()?.optJSONObject("inbox"), InboxCategory.SECONDARY, "pending")
+        // When the listing itself fails there is nothing to iterate, and every existing
+        // conversation goes quiet even though each one is still readable on its own. Refresh the
+        // threads we already know by id so messages keep arriving; only genuinely new threads
+        // are missed until the listing recovers.
+        if (primary?.optJSONArray("threads") == null) refreshKnownThreads()
+    }
+
+    private suspend fun refreshKnownThreads() {
+        val known = repo.conversationsForTransport(ID)
+        if (known.isEmpty()) return
+        Log.i(TAG, "inbox listing unavailable; refreshing ${known.size} known threads by id")
+        for (c in known) {
+            val thread = runCatching { api.fetchThread(c.externalId) }
+                .onFailure { Log.w(TAG, "thread ${c.externalId} refresh failed", it) }
+                .getOrNull() ?: continue
+            runCatching { syncThread(thread, c.category) }
+                .onFailure { Log.w(TAG, "thread ${c.externalId} sync failed", it) }
+        }
+    }
+
+    private suspend fun syncThreads(inbox: JSONObject?, category: InboxCategory, label: String = "") {
+        val threads = inbox?.optJSONArray("threads") ?: return
+        if (label.isNotEmpty()) Log.i(TAG, "inbox[$label]: ${threads.length()} threads")
         for (i in 0 until threads.length()) {
-            val thread = threads.getJSONObject(i)
+            syncThread(threads.getJSONObject(i), category)
+        }
+    }
+
+    private suspend fun syncThread(thread: JSONObject, category: InboxCategory) {
+        val me = account.userId
+        run {
             val threadId = thread.optString("thread_id")
-            if (threadId.isBlank()) continue
+            if (threadId.isBlank()) return
             // The other participant(s) name the conversation.
             val users = thread.optJSONArray("users")
             val other = (0 until (users?.length() ?: 0)).map { users!!.getJSONObject(it) }
@@ -152,24 +189,41 @@ class InstagramTransport(
 
             val convo = repo.upsertConversation(
                 transportId = ID, externalId = threadId, address = address,
-                title = title, category = InboxCategory.PRIMARY,
+                title = title, category = category,
             )
+            // upsert only titles on creation, so a renamed group or a contact who changed their
+            // display name would keep the old title forever.
+            if (title.isNotBlank() && title != convo.title) repo.setConversationTitle(convo.id, title)
             // Profile picture: download once per thread (keyed by thread id, like the inbox reads).
             if (other != null && !avatarStore.has(threadId)) {
                 other.optString("profile_pic_url").ifBlank { null }
                     ?.let { url -> api.download(url)?.let { avatarStore.save(threadId, it) } }
             }
 
-            val items = thread.optJSONArray("items") ?: continue
+            val items = thread.optJSONArray("items") ?: return
             // Items come newest-first; insert oldest-first so ordering is chronological.
             for (k in items.length() - 1 downTo 0) {
                 recordItem(convo, items.getJSONObject(k), me)
+            }
+            // The newest INCOMING item actually in this thread. The read-sync below has to be
+            // judged against this, not against last_permanent_item: an ephemeral or visual
+            // message leaves last_permanent_item pointing at something older, and an earlier
+            // last_seen_at then reads as "already seen" — marking the thread read and cancelling
+            // the notification for a message that just arrived.
+            var newestIncoming = 0L
+            for (k in 0 until items.length()) {
+                val it = items.optJSONObject(k) ?: continue
+                if (it.opt("user_id")?.toString() == me) continue
+                newestIncoming = maxOf(newestIncoming, it.optLong("timestamp", 0L))
             }
 
             // Read-sync across devices: if THIS account has already seen the newest item (e.g. we
             // opened the DM on our phone), clear the local unread dot + notification here too.
             val lastSeenAt = thread.optJSONObject("last_seen_at")
-            val lastItemTs = thread.optJSONObject("last_permanent_item")?.optLong("timestamp") ?: 0L
+            val lastItemTs = maxOf(
+                newestIncoming,
+                thread.optJSONObject("last_permanent_item")?.optLong("timestamp") ?: 0L,
+            )
             val mySeenTs = me?.let {
                 lastSeenAt?.optJSONObject(it)?.optString("timestamp")?.toLongOrNull()
             } ?: 0L
