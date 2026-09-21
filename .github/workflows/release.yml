@@ -3,8 +3,9 @@ name: Build Release APK
 # Builds a signed release APK. Runs on every push to main (artifact only) and, when you push a
 # version tag like `v0.1.0`, also publishes the APK to a GitHub Release.
 #
-# The native library (app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so) is committed prebuilt —
-# its Rust source (OpenBubbles' rustpush) lives outside this repo, so CI only runs Gradle.
+# The native library (app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so) is committed prebuilt,
+# so CI only runs Gradle. Rebuilding it needs OpenBubbles' rustpush cloned locally plus the patch
+# series in app/src/main/rust/patches — see the README there.
 on:
   push:
     branches: [main]

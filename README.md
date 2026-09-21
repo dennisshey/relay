@@ -54,7 +54,9 @@ Without a tag, the APK is in the workflow run's artifacts. Grab `relay-<version>
 
 ## Building it yourself
 
-The app is Kotlin and Compose, built the normal way with Gradle (`./gradlew :app:assembleRelease`, JDK 17). The native iMessage library (`app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so`) is checked in already compiled. Its Rust source (my fork of rustpush plus the JNI glue) lives outside this repo and needs Apple binaries to build, so CI and a plain Gradle build just package the existing `.so`. A CI-built APK does full on-device iMessage just like a local one; it still asks for the Mac config and your Apple ID the first time you run it.
+The app is Kotlin and Compose, built the normal way with Gradle (`./gradlew :app:assembleRelease`, JDK 17). The native iMessage library (`app/src/main/jniLibs/arm64-v8a/libaviary_imessage.so`) is checked in already compiled, so CI and a plain Gradle build just package the existing `.so`. A CI-built APK does full on-device iMessage just like a local one; it still asks for the Mac config and your Apple ID the first time you run it.
+
+Rebuilding that library is its own exercise. The JNI glue is here in `app/src/main/rust/aviary_imessage`, but it builds against OpenBubbles' rustpush, which isn't vendored — you clone it and apply the patch series in `app/src/main/rust/patches`, which pins the upstream commits and carries the three changes that matter: the activation cert rustpush ships referencing isn't in its repo, the on-device Apple ADI provider was deleted upstream (without it anisette would need a third-party server, which defeats the point), and its validation-data implementation is three `todo!()`s. That last one is an emulator for Apple's own `IMDAppleServices`, and it has a test that checks it end to end against published reference hardware — 517 bytes of validation data, where a missing piece of hardware identity silently yields 389 and Apple refuses to register you.
 
 Releases are signed with a checked-in Android debug key (the standard `android` password), so every build (mine, yours, CI's) shares one signature and can update over the last.
 
