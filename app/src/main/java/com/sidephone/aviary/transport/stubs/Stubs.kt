@@ -680,12 +680,21 @@ class IMessageTransport(
         // Tapback/reaction on an existing message.
         if (msg.optBoolean("reaction", false)) {
             val target = msg.optString("target").ifBlank { return }
-            val from = msg.optString("from").let { if (it == "me") "me" else cleanHandle(it) }
-            repo.applyReaction(
-                id, target, from,
-                emoji = msg.optString("emoji").ifBlank { null },
-                remove = !msg.optBoolean("enable", true),
-            )
+            val rawFrom = msg.optString("from")
+            val from = rawFrom.let { if (it == "me") "me" else cleanHandle(it) }
+            val emoji = msg.optString("emoji").ifBlank { null }
+            val added = msg.optBoolean("enable", true)
+            // What this person had on the message before, so a tapback Apple is merely
+            // re-delivering (it caches and replays on every reconnect, and reactions carry no
+            // guid to dedupe on) doesn't notify a second time.
+            val had = repo.messageByExternal(id, target)?.reactions
+                ?.let { runCatching { JSONObject(it).optString(from) }.getOrNull() }.orEmpty()
+            repo.applyReaction(id, target, from, emoji = emoji, remove = !added)
+            // A tapback someone put on one of OUR messages is worth a notification; our own,
+            // removals, repeats, and tapbacks on other people's messages are not.
+            if (added && from != "me" && emoji != null && had != emoji) {
+                notifyReaction(target, rawFrom, emoji, msg.optLong("timestamp", 0L))
+            }
             return
         }
         // A message you send to yourself (e.g. from your Mac) has no "other" participant, so the
@@ -858,6 +867,29 @@ class IMessageTransport(
                 muted = muted,
             )
         }
+    }
+
+    /** Notify about a tapback, but only when it landed on a message we sent. */
+    private suspend fun notifyReaction(
+        targetGuid: String, fromHandle: String, emoji: String, timestamp: Long,
+    ) {
+        val target = repo.messageByExternal(id, targetGuid) ?: return
+        if (!target.outgoing) return
+        val convo = repo.getConversation(target.conversationId) ?: return
+        val isGroup = convo.externalId.contains(";")
+        com.sidephone.aviary.data.Notifier.postReaction(
+            context, convo.id,
+            reactor = resolveContact(fromHandle).first ?: cleanHandle(fromHandle),
+            emoji = emoji,
+            targetPreview = target.body.ifBlank {
+                com.sidephone.aviary.data.mediaLabel(target.mediaType)
+            },
+            avatarPath = avatarStore.path(convo.externalId),
+            timestamp = if (timestamp > 0) timestamp else System.currentTimeMillis(),
+            isGroup = isGroup,
+            groupTitle = convo.groupName?.takeIf { it.isNotBlank() } ?: convo.title,
+            muted = convo.muted || convo.category == InboxCategory.SECONDARY,
+        )
     }
 
     /** Strip the iMessage handle scheme, e.g. "mailto:a@b.com" -> "a@b.com", "tel:+1..." -> "+1...". */

@@ -29,6 +29,42 @@ object Notifier {
     private val history = java.util.concurrent.ConcurrentHashMap<Long, MutableList<Line>>()
 
     /**
+     * Someone reacted to one of YOUR messages. Rendered as another line in the conversation's
+     * notification rather than anything separate, so a tapback reads the way it does in
+     * Messages or Signal and doesn't compete with the thread's own notification.
+     *
+     * Only worth posting for a reaction ADDED by someone else to a message you sent — removals
+     * and your own reactions are silent, as is a reaction to somebody else's message, which
+     * would otherwise make any busy group unusable.
+     */
+    fun postReaction(
+        context: Context,
+        conversationId: Long,
+        reactor: String,
+        emoji: String,
+        targetPreview: String,
+        avatarPath: String?,
+        timestamp: Long = System.currentTimeMillis(),
+        isGroup: Boolean = false,
+        groupTitle: String? = null,
+        muted: Boolean = false,
+    ) {
+        val quoted = targetPreview.trim().replace('\n', ' ').take(60)
+        post(
+            context = context,
+            conversationId = conversationId,
+            sender = reactor,
+            body = if (quoted.isBlank()) "Reacted $emoji to your message"
+            else "Reacted $emoji to \"$quoted\"",
+            avatarPath = avatarPath,
+            timestamp = timestamp,
+            isGroup = isGroup,
+            groupTitle = groupTitle,
+            muted = muted,
+        )
+    }
+
+    /**
      * Post (or update) the notification for [conversationId]. No-op when that thread is
      * already open. [avatarPath] is an optional avatar image file for the sender icon.
      */

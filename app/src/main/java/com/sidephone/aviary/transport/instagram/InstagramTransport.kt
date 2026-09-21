@@ -249,7 +249,7 @@ class InstagramTransport(
         item.optString("client_context").ifBlank { null }?.let { replyContexts[itemId] = it }
         // Reactions live on the item and can change on already-stored messages, so reconcile them
         // every poll (before the dedup return below).
-        reconcileReactions(itemId, item, me)
+        reconcileReactions(convo, itemId, item, me)
         // Skip items we've already stored, so we don't re-download media every poll.
         if (repo.messageByExternal(ID, itemId) != null) return
         val fromMe = item.get("user_id").toString() == me
@@ -306,8 +306,15 @@ class InstagramTransport(
      * reactions and the classic ❤️ "like"; our own reactions map to "me" so they don't duplicate
      * the optimistic one. Replacing the whole map also picks up removals.
      */
-    private suspend fun reconcileReactions(itemId: String, item: JSONObject, me: String?) {
-        if (!item.has("reactions")) return // no reaction info in this item — leave as-is
+    private suspend fun reconcileReactions(
+        convo: ConversationEntity, itemId: String, item: JSONObject, me: String?,
+    ) {
+        if (!item.has("reactions")) return
+        // What we had before, so a reaction that is genuinely new can be told apart from the
+        // ones this poll is merely re-reporting. A message we have never stored returns null
+        // here, which is what keeps the first sync of a thread from notifying for its whole
+        // back catalogue of reactions.
+        val existing = repo.messageByExternal(ID, itemId) // no reaction info in this item — leave as-is
         val reactions = item.optJSONObject("reactions")
         val map = JSONObject()
         reactions?.optJSONArray("emojis")?.let { arr ->
@@ -325,6 +332,25 @@ class InstagramTransport(
                 val sid = r.opt("sender_id")?.toString() ?: continue
                 val key = if (sid == me) "me" else sid
                 if (!map.has(key)) map.put(key, "❤️")
+            }
+        }
+        // Only a new reaction, from someone else, on a message we sent.
+        if (existing != null && existing.outgoing) {
+            val before = org.json.JSONObject(existing.reactions ?: "{}")
+            val added = map.keys().asSequence()
+                .filter { it != "me" && map.optString(it) != before.optString(it) }
+                .firstOrNull()
+            if (added != null) {
+                com.sidephone.aviary.data.Notifier.postReaction(
+                    context, convo.id,
+                    reactor = convo.title,
+                    emoji = map.optString(added),
+                    targetPreview = existing.body.ifBlank {
+                        com.sidephone.aviary.data.mediaLabel(existing.mediaType)
+                    },
+                    avatarPath = avatarStore.path(convo.externalId),
+                    muted = convo.muted || convo.category == InboxCategory.SECONDARY,
+                )
             }
         }
         repo.setReactionsByExternal(ID, itemId, if (map.length() == 0) null else map.toString())

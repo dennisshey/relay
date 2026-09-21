@@ -438,7 +438,14 @@ class SignalReceiver(
                 if (targetAuthor != null && targetAuthor == account.aci) "out:$targetTs"
                 else "$targetAuthor:$targetTs"
             val from = if (outgoing) "me" else fromAci
+            // Same guard as elsewhere: a resent envelope shouldn't notify twice.
+            val had = repo.messageByExternal(SignalTransport.ID, targetExternalId)?.reactions
+                ?.let { runCatching { org.json.JSONObject(it).optString(from) }.getOrNull() }
+                .orEmpty()
             repo.applyReaction(SignalTransport.ID, targetExternalId, from, emoji, remove)
+            if (!outgoing && !remove && !emoji.isNullOrBlank() && had != emoji) {
+                notifyReaction(targetExternalId, fromAci, emoji, ts = serverTimestamp)
+            }
             return
         }
 
@@ -503,8 +510,13 @@ class SignalReceiver(
                 val length = (MiniProto.varintField(f, 2) ?: 1L).toInt()
                 Triple(start, length, aci)
             }.toList()
+        // "@mentioned" isn't the only way a group message is aimed at you — a reply quoting
+        // one of your messages is too, and those were staying silent in a secondary group.
         val mentioned = mentionRanges.any { it.third.equals(account.aci, ignoreCase = true) }
         val renderedText = applyMentions(text, mentionRanges)
+
+        val repliedToMe = replyToExternalId?.startsWith("out:") == true
+        val aimedAtMe = mentioned || repliedToMe
 
         val msgSender = if (outgoing) "me" else fromAci
         val msgExternalId = if (outgoing) "out:$ts" else "$fromAci:$ts"
@@ -516,7 +528,7 @@ class SignalReceiver(
                 text = renderedText, ts = ts, outgoing = outgoing,
                 mediaPath = mediaPath, mediaType = mediaType,
                 replyToExternalId = replyToExternalId, replyToPreview = replyToPreview,
-                mentioned = mentioned,
+                aimedAtMe = aimedAtMe,
             )
         } else {
             val convoAci = if (outgoing) (recipientAci ?: return) else fromAci
@@ -530,7 +542,7 @@ class SignalReceiver(
                 text = renderedText, ts = ts, outgoing = outgoing,
                 mediaPath = mediaPath, mediaType = mediaType,
                 replyToExternalId = replyToExternalId, replyToPreview = replyToPreview,
-                mentioned = mentioned,
+                aimedAtMe = aimedAtMe,
             )
         }
 
@@ -568,7 +580,8 @@ class SignalReceiver(
         text: String, ts: Long, outgoing: Boolean,
         mediaPath: String? = null, mediaType: String? = null,
         replyToExternalId: String? = null, replyToPreview: String? = null,
-        mentioned: Boolean = false,
+        /** The message @mentions you or replies to something you sent. */
+        aimedAtMe: Boolean = false,
     ): com.sidephone.aviary.data.ConversationEntity {
         val convo = repo.upsertConversation(
             transportId = SignalTransport.ID,
@@ -598,10 +611,14 @@ class SignalReceiver(
             val isGroup = externalId.startsWith("group:")
             val senderName = contactNames.get(messageSender)
                 ?: if (isGroup) "Someone" else convo.title
-            // Secondary groups notify only when you're @mentioned; secondary 1:1 threads still
-            // notify for every message; primary always notifies.
-            val muted = convo.muted ||
-                (convo.category == InboxCategory.SECONDARY && isGroup && !mentioned)
+            // A group message aimed at you — an @mention, or a reply to something you sent —
+            // gets through even when the group is muted or filed as secondary. That is how
+            // Signal itself treats mentions in a muted chat, and it is the whole point of
+            // muting a busy group rather than leaving it: you still want the parts meant for
+            // you. Everything else follows the usual rules — secondary groups stay quiet,
+            // secondary 1:1 threads still notify, primary always notifies.
+            val muted = if (isGroup && aimedAtMe) false
+            else convo.muted || (convo.category == InboxCategory.SECONDARY && isGroup)
             com.sidephone.aviary.data.Notifier.post(
                 context, convo.id,
                 sender = senderName,
@@ -615,6 +632,32 @@ class SignalReceiver(
             )
         }
         return convo
+    }
+
+    /**
+     * Notify about a reaction, but only when it landed on a message we sent — a tapback on
+     * somebody else's message in a busy group is not news.
+     */
+    private suspend fun notifyReaction(
+        targetExternalId: String, fromAci: String, emoji: String, ts: Long,
+    ) {
+        val target = repo.messageByExternal(SignalTransport.ID, targetExternalId) ?: return
+        if (!target.outgoing) return
+        val convo = repo.getConversation(target.conversationId) ?: return
+        val isGroup = convo.externalId.startsWith("group:")
+        com.sidephone.aviary.data.Notifier.postReaction(
+            context, convo.id,
+            reactor = contactNames.get(fromAci) ?: if (isGroup) "Someone" else convo.title,
+            emoji = emoji,
+            targetPreview = target.body.ifBlank {
+                com.sidephone.aviary.data.mediaLabel(target.mediaType)
+            },
+            avatarPath = avatarStore.path(fromAci) ?: avatarStore.path(convo.externalId),
+            timestamp = if (ts > 0) ts else System.currentTimeMillis(),
+            isGroup = isGroup,
+            groupTitle = convo.title,
+            muted = convo.muted || convo.category == InboxCategory.SECONDARY,
+        )
     }
 
     /** Fetch the sender's profile name + avatar; rename their 1:1 thread. */
