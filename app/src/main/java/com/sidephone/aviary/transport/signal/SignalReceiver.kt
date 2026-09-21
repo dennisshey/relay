@@ -430,7 +430,9 @@ class SignalReceiver(
             val r = MiniProto.parse(reactBytes)
             val emoji = MiniProto.stringField(r, 1)
             val remove = (MiniProto.varintField(r, 2) ?: 0L) != 0L
-            val targetAuthor = MiniProto.stringField(r, 4) // targetAuthorAci
+            // targetAuthorAci(4) string or targetAuthorAciBinary(6) raw ServiceId.
+            val targetAuthor = MiniProto.stringField(r, 4)
+                ?: MiniProto.bytesField(r, 6)?.let { serviceIdToUuid(it) }
             val targetTs = MiniProto.varintField(r, 5) ?: return // targetSentTimestamp
             val targetExternalId =
                 if (targetAuthor != null && targetAuthor == account.aci) "out:$targetTs"
@@ -451,10 +453,11 @@ class SignalReceiver(
         MiniProto.bytesField(dm, 8)?.let { quoteBytes ->
             val q = MiniProto.parse(quoteBytes)
             val qTs = MiniProto.varintField(q, 1) ?: return@let // Quote.id (target sent ts)
-            // Modern Signal carries the author as authorAciBinary(8), a raw ServiceId;
-            // fall back to the legacy string author(2) for older senders.
+            // authorAciBinary(8) is the raw ServiceId, authorAci(5) the string form; senders
+            // populate one or both depending on version. Field 2 is reserved (it was the old
+            // E164) and must not be read.
             val qAuthor = MiniProto.bytesField(q, 8)?.let { serviceIdToUuid(it) }
-                ?: MiniProto.stringField(q, 2)
+                ?: MiniProto.stringField(q, 5)
             replyToExternalId =
                 if (qAuthor != null && qAuthor == account.aci) "out:$qTs" else "$qAuthor:$qTs"
             replyToPreview = MiniProto.stringField(q, 3)?.take(90) // Quote.text snapshot

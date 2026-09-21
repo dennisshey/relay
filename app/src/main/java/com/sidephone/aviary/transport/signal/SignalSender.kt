@@ -139,12 +139,16 @@ class SignalSender(
         targetAuthorAci: String, targetTs: Long, emoji: String, remove: Boolean, ts: Long,
         groupContext: ByteArray?,
     ): ByteArray {
-        val reaction = MiniProto.Writer()
+        // Same dual-field story as Quote: targetAuthorAci(4) is the string form and
+        // targetAuthorAciBinary(6) the 16-byte one. Send both so any client version can
+        // match the reaction to its target.
+        val reactionW = MiniProto.Writer()
             .string(1, emoji)
             .varint(2, if (remove) 1 else 0)
-            .string(4, targetAuthorAci)  // targetAuthorAci (string ACI, matches our receive parse)
+            .string(4, targetAuthorAci)  // targetAuthorAci
             .varint(5, targetTs)         // targetSentTimestamp
-            .toByteArray()
+        aciToBytes(targetAuthorAci)?.let { reactionW.bytes(6, it) }
+        val reaction = reactionW.toByteArray()
         return MiniProto.Writer().varint(7, ts).bytes(16, reaction)
             .also { if (groupContext != null) it.bytes(15, groupContext) }
             .toByteArray()
@@ -341,6 +345,11 @@ class SignalSender(
             .varint(1, q.targetTimestamp)
             .string(3, q.text)
             .varint(7, 0) // Quote.Type.NORMAL
+            // Signal is mid-migration from string ServiceIds to binary and carries BOTH
+            // authorAci(5) and authorAciBinary(8). Which one a client reads depends on its
+            // version, so send both: sending only the binary left older clients unable to find
+            // the author, and they rendered the reply as an ordinary message.
+            .string(5, q.authorAci)
         aciToBytes(q.authorAci)?.let { w.bytes(8, it) }
         return w.toByteArray()
     }

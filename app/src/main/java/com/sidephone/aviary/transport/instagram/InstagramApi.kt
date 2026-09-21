@@ -40,9 +40,9 @@ class InstagramApi(
 
     // ---- headers -----------------------------------------------------------
 
-    private fun Request.Builder.commonHeaders(): Request.Builder = apply {
+    private fun Request.Builder.commonHeaders(appId: String = InstagramDevice.APP_ID): Request.Builder = apply {
         header("User-Agent", device.userAgent)
-        header("X-IG-App-ID", InstagramDevice.APP_ID)
+        header("X-IG-App-ID", appId)
         header("X-IG-Capabilities", InstagramDevice.CAPABILITIES)
         header("X-IG-Connection-Type", "WIFI")
         header("X-IG-Device-ID", device.deviceId)
@@ -260,38 +260,61 @@ class InstagramApi(
      * appears in the default response, so polling only the default silently loses those messages.
      */
     /**
-     * The DM inbox for a folder. Instagram is picky about the query it will accept here and
-     * changes its mind over time: the long-standing form started answering HTTP 404 (with a
-     * nonsense `item_ack` body) for the default folder while the very same query with an
-     * explicit folder worked. Rather than pin one spelling, try the known-good shapes in order
-     * and keep the first that actually yields threads — a 404 on the primary inbox means no
-     * messages arrive at all, which is not worth a brittle URL.
+     * The DM inbox for a folder, assembled by paging.
+     *
+     * Asking for a full page of threads at once returns HTTP 404 on this account — not an auth
+     * problem, a server-side one: `limit=5` succeeds and `limit=8` fails, consistently, so some
+     * thread further down the list fails to serialize and takes the whole response with it.
+     * Because the listing is ordered newest-first and returns a working cursor, paging in small
+     * batches walks around it and still reaches everything above it. A page that fails ends the
+     * walk and we keep what we already have, which is what matters: the newest threads, the ones
+     * with new messages in them.
      */
     fun fetchInbox(folder: Int? = null): JSONObject? {
         val label = if (folder == null) "primary" else "folder$folder"
-        val f = folder ?: 0
-        val candidates = listOf(
-            "?visual_message_return_type=unseen&thread_message_limit=10&persistentBadging=true&limit=20&folder=$f",
-            "?visual_message_return_type=unseen&thread_message_limit=10&persistentBadging=true&limit=20" +
-                folder?.let { "&folder=$it" }.orEmpty(),
-            "?thread_message_limit=10&limit=20&folder=$f",
-            "?persistentBadging=true&folder=$f",
-        )
-        for ((i, q) in candidates.withIndex()) {
-            val json = inboxRequest("$base/direct_v2/inbox/$q", label, quiet = i < candidates.lastIndex)
-            if (json?.optJSONObject("inbox")?.optJSONArray("threads") != null) {
-                if (i > 0) Log.i(TAG, "inbox[$label]: query #$i is the one this account accepts")
-                return json
-            }
+        val folderParam = folder?.let { "&folder=$it" }.orEmpty()
+        val merged = JSONArray()
+        var cursor: String? = null
+        var pages = 0
+
+        while (pages < MAX_INBOX_PAGES && merged.length() < MAX_INBOX_THREADS) {
+            val page = pageSizes.firstNotNullOfOrNull { size ->
+                val c = cursor?.let { "&cursor=" + java.net.URLEncoder.encode(it, "UTF-8") }.orEmpty()
+                inboxRequest(
+                    "$base/direct_v2/inbox/?visual_message_return_type=unseen" +
+                        "&thread_message_limit=10&persistentBadging=true&limit=$size$folderParam$c",
+                    label,
+                    // A failing page is the expected end of the walk, not an error.
+                    quiet = true,
+                )?.optJSONObject("inbox")?.takeIf { it.optJSONArray("threads") != null }
+            } ?: break
+
+            val threads = page.optJSONArray("threads") ?: break
+            for (i in 0 until threads.length()) merged.put(threads.get(i))
+            pages++
+            if (!page.optBoolean("has_older")) break
+            cursor = page.optString("oldest_cursor").ifBlank { null } ?: break
         }
-        return null
+
+        // A folder that is simply empty returns a valid first page with no threads; only a
+        // first page that never succeeded means the listing is unreadable.
+        if (pages == 0) {
+            Log.w(TAG, "inbox[$label]: unreadable — even a single-thread page failed")
+            return null
+        }
+        Log.i(TAG, "inbox[$label]: ${merged.length()} threads over $pages page(s)")
+        // Hand back an inbox-shaped object carrying every thread we managed to collect.
+        return JSONObject().put("inbox", JSONObject().put("threads", merged))
     }
 
+    /** Page sizes to try, largest first. See [fetchInbox] for why a full page can fail. */
+    private val pageSizes = listOf(5, 3, 2, 1)
+    private val MAX_INBOX_PAGES = 8
+    private val MAX_INBOX_THREADS = 30
+
     /**
-     * One thread's recent history, by id. The inbox listing can fail server-side (this account
-     * has seen the default folder answer a flat HTTP 404 for days while every other call
-     * succeeds), and when it does this is the only way to keep already-known conversations
-     * receiving. Returns the thread object, shaped like the ones inside an inbox response.
+     * One thread's recent history, by id. A last resort for when the listing can't be paged at
+     * all: it keeps already-known conversations receiving, though it can't discover new ones.
      */
     fun fetchThread(threadId: String): JSONObject? {
         val req = Request.Builder()
@@ -315,8 +338,11 @@ class InstagramApi(
      * had quietly invalidated looked identical to an empty inbox — messages simply stopped
      * arriving with no indication why. Report what came back instead.
      */
-    private fun inboxRequest(url: String, label: String, quiet: Boolean = false): JSONObject? {
-        val req = Request.Builder().url(url).get().commonHeaders().build()
+    private fun inboxRequest(
+        url: String, label: String, quiet: Boolean = false,
+        appId: String = InstagramDevice.APP_ID,
+    ): JSONObject? {
+        val req = Request.Builder().url(url).get().commonHeaders(appId).build()
         http.newCall(req).execute().use { resp ->
             capture(resp)
             val text = resp.body?.string().orEmpty()

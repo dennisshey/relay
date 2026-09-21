@@ -52,7 +52,12 @@ class InstagramDevice(context: Context) {
             "$manufacturer; $model; $device; $cpu; en_US; $appVersionCode)"
 
     companion object {
+        /** Instagram's web app id — what this client has always sent. */
         const val APP_ID = "936619743392459"
+
+        /** The Android app's id. The User-Agent here is the Android app's, so this is the
+         *  consistent pairing; some direct_v2 routes answer one and 404 the other. */
+        const val APP_ID_ANDROID = "567067343352427"
         const val CAPABILITIES = "3brTvw=="
     }
 }
