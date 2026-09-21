@@ -29,7 +29,9 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        # v3 installs the obsolete `tools` SDK package, which Google has since removed from the
+        # repository — it started failing every build with "Failed to find package 'tools'".
+        uses: android-actions/setup-android@v4
 
       - name: Build release APK
         run: |
