@@ -69,7 +69,7 @@ class RelayApp : Application(), coil.ImageLoaderFactory {
         IMessageTransport(this, repository, appScope, avatarStore, mediaStore)
     }
     val instagramTransport: InstagramTransport by lazy {
-        InstagramTransport(this, repository, appScope, avatarStore, mediaStore)
+        InstagramTransport(this, repository, appScope, contactNames, avatarStore, mediaStore)
     }
 
     val router: com.sidephone.aviary.transport.MessageRouter by lazy {

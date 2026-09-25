@@ -3,11 +3,13 @@ package com.sidephone.aviary.transport.instagram
 import android.content.Context
 import android.util.Log
 import com.sidephone.aviary.data.ConversationEntity
+import com.sidephone.aviary.data.ContactNames
 import com.sidephone.aviary.data.InboxCategory
 import com.sidephone.aviary.data.MessageEntity
 import com.sidephone.aviary.data.MessageStatus
 import com.sidephone.aviary.data.Protocol
 import com.sidephone.aviary.data.UnifiedRepository
+import com.sidephone.aviary.data.isGroup
 import com.sidephone.aviary.transport.MessageTransport
 import com.sidephone.aviary.transport.TransportStatus
 import kotlinx.coroutines.CoroutineScope
@@ -30,6 +32,7 @@ class InstagramTransport(
     private val context: Context,
     private val repo: UnifiedRepository,
     private val scope: CoroutineScope,
+    private val contactNames: ContactNames,
     private val avatarStore: com.sidephone.aviary.data.AvatarStore,
     private val mediaStore: com.sidephone.aviary.data.MediaStore,
 ) : MessageTransport {
@@ -114,6 +117,10 @@ class InstagramTransport(
     // item_id -> client_context, captured while polling; used to thread outgoing replies.
     private val replyContexts = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    // Old builds cached the first member's face under a group's thread id. Reconcile each group
+    // once per process so that stale photo is removed or replaced with Instagram's group image.
+    private val reconciledGroupAvatars = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     // ---- receiving (inbox polling) ----------------------------------------
 
     private fun startPolling() {
@@ -178,24 +185,47 @@ class InstagramTransport(
         run {
             val threadId = thread.optString("thread_id")
             if (threadId.isBlank()) return
-            // The other participant(s) name the conversation.
+            // Instagram uses the same thread-id shape for 1:1 and group DMs, so participant count
+            // (rather than the id) is the authoritative group signal.
             val users = thread.optJSONArray("users")
-            val other = (0 until (users?.length() ?: 0)).map { users!!.getJSONObject(it) }
-                .firstOrNull { it.get("pk").toString() != me }
+            val others = (0 until (users?.length() ?: 0)).mapNotNull { users?.optJSONObject(it) }
+                .filter { it.opt("pk")?.toString() != me }
+            val other = others.firstOrNull()
+            val isGroup = thread.optBoolean("is_group", false) || others.size > 1
+            for (user in others) cacheParticipant(user)
+            val memberNames = others.mapNotNull { displayName(it) }
             val title = thread.optString("thread_title").ifBlank {
-                other?.optString("full_name").orEmptyIf() ?: other?.optString("username") ?: "Instagram"
+                if (isGroup) memberNames.joinToString(", ").ifBlank { "Instagram group" }
+                else memberNames.firstOrNull() ?: "Instagram"
             }
-            val address = other?.optString("username") ?: threadId
+            // A semicolon-delimited address is the existing persisted group marker used by the UI.
+            val address = if (isGroup) {
+                others.mapNotNull { it.optString("username").orEmptyIf() ?: it.opt("pk")?.toString() }
+                    .joinToString(";")
+            } else other?.optString("username").orEmptyIf() ?: threadId
 
-            val convo = repo.upsertConversation(
+            var convo = repo.upsertConversation(
                 transportId = ID, externalId = threadId, address = address,
                 title = title, category = category,
             )
+            if (address.isNotBlank() && address != convo.address) {
+                repo.setConversationAddress(convo.id, address)
+                convo = convo.copy(address = address)
+            }
             // upsert only titles on creation, so a renamed group or a contact who changed their
             // display name would keep the old title forever.
-            if (title.isNotBlank() && title != convo.title) repo.setConversationTitle(convo.id, title)
-            // Profile picture: download once per thread (keyed by thread id, like the inbox reads).
-            if (other != null && !avatarStore.has(threadId)) {
+            if (title.isNotBlank() && title != convo.title) {
+                repo.setConversationTitle(convo.id, title)
+                convo = convo.copy(title = title)
+            }
+            // A 1:1 uses the other person's photo. A group must never inherit one member's face;
+            // use Instagram's thread image when present, otherwise show the generic group glyph.
+            if (isGroup && reconciledGroupAvatars.add(threadId)) {
+                avatarStore.remove(threadId)
+                groupImageOf(thread)?.let { url ->
+                    api.download(url)?.let { avatarStore.save(threadId, it) }
+                }
+            } else if (!isGroup && other != null && !avatarStore.has(threadId)) {
                 other.optString("profile_pic_url").ifBlank { null }
                     ?.let { url -> api.download(url)?.let { avatarStore.save(threadId, it) } }
             }
@@ -203,7 +233,7 @@ class InstagramTransport(
             val items = thread.optJSONArray("items") ?: return
             // Items come newest-first; insert oldest-first so ordering is chronological.
             for (k in items.length() - 1 downTo 0) {
-                recordItem(convo, items.getJSONObject(k), me)
+                recordItem(convo, items.getJSONObject(k), me, isGroup)
             }
             // The newest INCOMING item actually in this thread. The read-sync below has to be
             // judged against this, not against last_permanent_item: an ephemeral or visual
@@ -243,16 +273,24 @@ class InstagramTransport(
         }
     }
 
-    private suspend fun recordItem(convo: ConversationEntity, item: JSONObject, me: String?) {
+    private suspend fun recordItem(
+        convo: ConversationEntity, item: JSONObject, me: String?, isGroup: Boolean,
+    ) {
         val itemId = item.optString("item_id").ifBlank { return }
+        val senderId = item.opt("user_id")?.toString().orEmpty()
+        val fromMe = senderId == me
+        val sender = if (fromMe) "me" else if (isGroup) senderId.ifBlank { convo.address } else convo.address
         // Cache the item's client_context so a later reply to it can thread server-side.
         item.optString("client_context").ifBlank { null }?.let { replyContexts[itemId] = it }
         // Reactions live on the item and can change on already-stored messages, so reconcile them
         // every poll (before the dedup return below).
         reconcileReactions(convo, itemId, item, me)
-        // Skip items we've already stored, so we don't re-download media every poll.
-        if (repo.messageByExternal(ID, itemId) != null) return
-        val fromMe = item.get("user_id").toString() == me
+        // Also repairs recent group messages saved by older builds as if every member were the
+        // first participant. Do this before the dedup return.
+        if (repo.messageByExternal(ID, itemId) != null) {
+            if (isGroup) repo.setSenderByExternal(ID, itemId, sender)
+            return
+        }
         val r = render(item) ?: return
         val tsMicros = item.optLong("timestamp", 0L)
         val timestamp = if (tsMicros > 0) tsMicros / 1000 else System.currentTimeMillis()
@@ -283,7 +321,7 @@ class InstagramTransport(
         val rowId = repo.recordMessage(
             MessageEntity(
                 conversationId = convo.id, transportId = ID, externalId = itemId,
-                sender = if (fromMe) "me" else convo.address,
+                sender = sender,
                 body = r.body, timestamp = timestamp, outgoing = fromMe,
                 status = if (fromMe) MessageStatus.SENT else MessageStatus.RECEIVED,
                 mediaPath = mediaPath, mediaType = mediaType, mediaUrl = mediaUrl,
@@ -291,14 +329,38 @@ class InstagramTransport(
             )
         )
         if (rowId > 0 && !fromMe) {
+            val senderName = if (isGroup) contactNames.get(sender) ?: sender else convo.title
             com.sidephone.aviary.data.Notifier.post(
-                context, convo.id, sender = convo.title,
+                context, convo.id, sender = senderName,
                 body = r.body.ifBlank { if (mediaPath != null) "📷 Photo" else "New message" },
-                avatarPath = avatarStore.path(convo.externalId),
+                avatarPath = if (isGroup) avatarStore.path(sender) ?: avatarStore.path(convo.externalId)
+                    else avatarStore.path(convo.externalId),
                 timestamp = timestamp,
                 muted = convo.muted || convo.category == InboxCategory.SECONDARY,
+                isGroup = isGroup,
+                groupTitle = if (isGroup) convo.title else null,
             )
         }
+    }
+
+    /** Cache a participant under their stable user id for group sender labels and notifications. */
+    private suspend fun cacheParticipant(user: JSONObject) {
+        val id = user.opt("pk")?.toString()?.takeIf { it.isNotBlank() } ?: return
+        displayName(user)?.let { contactNames.put(id, it) }
+        if (!avatarStore.has(id)) {
+            user.optString("profile_pic_url").orEmptyIf()
+                ?.let { url -> api.download(url)?.let { avatarStore.save(id, it) } }
+        }
+    }
+
+    private fun displayName(user: JSONObject): String? =
+        user.optString("full_name").orEmptyIf() ?: user.optString("username").orEmptyIf()
+
+    private fun groupImageOf(thread: JSONObject): String? {
+        val raw = thread.optString("thread_image").orEmptyIf()
+        if (raw?.startsWith("http") == true) return raw
+        val image = thread.optJSONObject("thread_image") ?: return null
+        return image.optString("url").orEmptyIf() ?: imageOf(image)
     }
 
     /**
@@ -341,15 +403,19 @@ class InstagramTransport(
                 .filter { it != "me" && map.optString(it) != before.optString(it) }
                 .firstOrNull()
             if (added != null) {
+                val group = convo.isGroup
                 com.sidephone.aviary.data.Notifier.postReaction(
                     context, convo.id,
-                    reactor = convo.title,
+                    reactor = if (group) contactNames.get(added) ?: added else convo.title,
                     emoji = map.optString(added),
                     targetPreview = existing.body.ifBlank {
                         com.sidephone.aviary.data.mediaLabel(existing.mediaType)
                     },
-                    avatarPath = avatarStore.path(convo.externalId),
+                    avatarPath = if (group) avatarStore.path(added) ?: avatarStore.path(convo.externalId)
+                        else avatarStore.path(convo.externalId),
                     muted = convo.muted || convo.category == InboxCategory.SECONDARY,
+                    isGroup = group,
+                    groupTitle = if (group) convo.title else null,
                 )
             }
         }

@@ -75,13 +75,14 @@ data class ConversationEntity(
 )
 
 /**
- * Group threads: Signal + group MMS are keyed "group:<id>"; an iMessage group is keyed by its
- * ";"-joined participant list. This is the ONE definition — phone-number matching and the
- * duplicate-thread merges must exclude groups, and an iMessage group's address is a participant
- * list whose trailing digits look exactly like a member's phone number.
+ * Group threads: Signal + group MMS are keyed "group:<id>"; iMessage uses a ";"-joined external
+ * participant list, while Instagram keeps its opaque thread id and persists that list in address.
+ * This is the ONE definition — phone-number matching and duplicate-thread merges must exclude
+ * groups whose participant lists otherwise look exactly like a member's 1:1 address.
  */
 val ConversationEntity.isGroup: Boolean
-    get() = externalId.startsWith("group:") || externalId.contains(";")
+    get() = externalId.startsWith("group:") || externalId.contains(";") ||
+        (transportId == "instagram" && address.contains(";"))
 
 /** The name to show for a conversation: a known group name wins over the member-list title. */
 val ConversationEntity.displayTitle: String
@@ -277,6 +278,9 @@ interface MessageDao {
 
     @Query("UPDATE messages SET reactions = :reactions WHERE id = :id")
     suspend fun setReactions(id: Long, reactions: String?)
+
+    @Query("UPDATE messages SET sender = :sender WHERE id = :id")
+    suspend fun setSender(id: Long, sender: String)
 
     @Query("UPDATE messages SET status = :status WHERE transportId = :transportId AND externalId = :externalId")
     suspend fun setStatusByExternal(transportId: String, externalId: String, status: MessageStatus)

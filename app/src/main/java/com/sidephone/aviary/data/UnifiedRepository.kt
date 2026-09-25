@@ -241,6 +241,12 @@ class UnifiedRepository(private val db: AviaryDatabase) {
         db.messages().setReactions(msg.id, reactions)
     }
 
+    /** Repair sender attribution when a transport learns participant identities after insertion. */
+    suspend fun setSenderByExternal(transportId: String, externalId: String, sender: String) {
+        val msg = db.messages().getByExternal(transportId, externalId) ?: return
+        if (msg.sender != sender) db.messages().setSender(msg.id, sender)
+    }
+
     /** Outgoing messages that failed to send — the offline outbox, oldest first. */
     suspend fun failedOutgoing(): List<MessageEntity> =
         db.messages().outgoingWithStatus(MessageStatus.FAILED)
