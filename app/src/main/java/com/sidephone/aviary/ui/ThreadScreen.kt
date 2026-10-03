@@ -275,10 +275,15 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
     }
     var attachMenuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<String?>(null) }
+    // On this screen the on-screen keyboard leaves room for the composer and almost nothing else,
+    // so the top bar gives its space to the conversation while it's up. Typing on the T9 keypad
+    // keeps the bar: that keyboard costs no screen. Back still works either way — the first back
+    // gesture closes the on-screen keyboard and the bar comes straight back.
+    val keyboardUp = rememberOnScreenKeyboardVisible()
 
     Scaffold(
         topBar = {
-            TopAppBar(
+            if (!keyboardUp) TopAppBar(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
@@ -1233,6 +1238,46 @@ private fun ReplyPreviewBar(
             )
         }
     }
+}
+
+/**
+ * Whether a full on-screen keyboard is covering the screen.
+ *
+ * "An input method is showing" isn't the question: the SP-01 types on its physical keypad through
+ * an input method too (Traditional T9), and that one reports as visible while drawing at most a
+ * small suggestion strip. What matters is how much screen is lost, so this only counts a keyboard
+ * taller than a third of the display — the on-screen keyboard here takes about two thirds; T9's
+ * strip is a fraction of that. Judging by height rather than by which input method is active also
+ * stays right if T9 is switched to its on-screen keypad.
+ *
+ * Compose's own `WindowInsets.isImeVisible` only works once a window opts out of fitting system
+ * windows, which this app doesn't, so this reads the window's raw root insets, which report the
+ * keyboard on API 30+ regardless. Re-checked on every layout pass, which `adjustResize` triggers
+ * whenever the keyboard opens, closes, or changes size.
+ */
+@Composable
+private fun rememberOnScreenKeyboardVisible(): Boolean {
+    val view = androidx.compose.ui.platform.LocalView.current
+    var visible by remember { mutableStateOf(false) }
+    androidx.compose.runtime.DisposableEffect(view) {
+        var lastHeight = -1
+        fun check() {
+            val insets = androidx.core.view.ViewCompat.getRootWindowInsets(view)
+            val ime = androidx.core.view.WindowInsetsCompat.Type.ime()
+            val height = if (insets?.isVisible(ime) == true) insets.getInsets(ime).bottom else 0
+            val screen = view.resources.displayMetrics.heightPixels
+            if (height != lastHeight) {
+                lastHeight = height
+                android.util.Log.d("Keyboard", "input method height $height of $screen px")
+            }
+            visible = height > screen / 3
+        }
+        val listener = android.view.ViewTreeObserver.OnGlobalLayoutListener { check() }
+        view.viewTreeObserver.addOnGlobalLayoutListener(listener)
+        check()
+        onDispose { view.viewTreeObserver.removeOnGlobalLayoutListener(listener) }
+    }
+    return visible
 }
 
 /** iMessage-style pill composer with the circular ↑ send button. */
