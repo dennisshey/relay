@@ -1236,6 +1236,7 @@ private fun ReplyPreviewBar(
 }
 
 /** iMessage-style pill composer with the circular ↑ send button. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Composer(
     draft: String,
@@ -1324,12 +1325,18 @@ private fun Composer(
                 }
             }
         }
+    // Height matters here more than anywhere else in the app. On a 480x640 screen the keyboard
+    // takes two thirds of the display, leaving about 55dp under the top bar for the message list
+    // AND this row. The stock OutlinedTextField wants 56dp on its own with fixed 16dp inner
+    // padding, so when the row got squeezed the padding held and the text line absorbed the loss
+    // — typing showed up as a one-pixel sliver. This row now needs ~48dp, and the field below
+    // controls its own padding so it can't happen again.
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
         verticalAlignment = Alignment.Bottom
     ) {
         Box(
-            Modifier.padding(bottom = 6.dp).size(40.dp).clickable(onClick = onAttach),
+            Modifier.size(40.dp).clickable(onClick = onAttach),
             contentAlignment = Alignment.Center,
         ) {
             Icon(
@@ -1340,32 +1347,61 @@ private fun Composer(
             )
         }
         Spacer(Modifier.size(4.dp))
-        OutlinedTextField(
+        // Same pill as OutlinedTextField, built from its own parts so the inner padding is ours.
+        val fieldColors = OutlinedTextFieldDefaults.colors(
+            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+            focusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f),
+        )
+        val fieldInteraction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+        val fieldShape = RoundedCornerShape(22.dp)
+        androidx.compose.foundation.text.BasicTextField(
             value = draft,
             onValueChange = onDraftChange,
-            modifier = Modifier.weight(1f),
-            placeholder = {
-                Text(
-                    when (sendProtocol) {
-                        Protocol.IMESSAGE -> "iMessage"
-                        Protocol.SMS -> "Text Message · SMS"
-                        else -> sendProtocol.displayName
+            modifier = Modifier.weight(1f).heightIn(min = 40.dp),
+            textStyle = MaterialTheme.typography.bodyLarge
+                .copy(color = MaterialTheme.colorScheme.onSurface),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+            // Past four lines the field scrolls inside itself; if the keyboard leaves less room
+            // than that, it scrolls sooner, keeping the line you're typing on in view.
+            maxLines = 4,
+            interactionSource = fieldInteraction,
+            decorationBox = { inner ->
+                OutlinedTextFieldDefaults.DecorationBox(
+                    value = draft,
+                    innerTextField = inner,
+                    enabled = true,
+                    singleLine = false,
+                    visualTransformation = androidx.compose.ui.text.input.VisualTransformation.None,
+                    interactionSource = fieldInteraction,
+                    placeholder = {
+                        Text(
+                            when (sendProtocol) {
+                                Protocol.IMESSAGE -> "iMessage"
+                                Protocol.SMS -> "Text Message · SMS"
+                                else -> sendProtocol.displayName
+                            },
+                            color = MaterialTheme.colorScheme.outline
+                        )
                     },
-                    color = MaterialTheme.colorScheme.outline
+                    colors = fieldColors,
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    container = {
+                        OutlinedTextFieldDefaults.ContainerBox(
+                            enabled = true,
+                            isError = false,
+                            interactionSource = fieldInteraction,
+                            colors = fieldColors,
+                            shape = fieldShape,
+                        )
+                    },
                 )
             },
-            shape = RoundedCornerShape(22.dp),
-            colors = OutlinedTextFieldDefaults.colors(
-                unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
-                focusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f),
-            ),
-            maxLines = 4,
         )
         Spacer(Modifier.size(8.dp))
         // Send button when there's text; otherwise a mic to record a voice note.
         if (draft.isNotBlank()) {
             Box(
-                Modifier.padding(bottom = 6.dp).size(40.dp)
+                Modifier.size(40.dp)
                     .background(sendProtocol.color, CircleShape)
                     .clickable(onClick = onSend),
                 contentAlignment = Alignment.Center,
@@ -1374,7 +1410,7 @@ private fun Composer(
             }
         } else {
             Box(
-                Modifier.padding(bottom = 6.dp).size(40.dp)
+                Modifier.size(40.dp)
                     .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), CircleShape)
                     .clickable {
                         if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
