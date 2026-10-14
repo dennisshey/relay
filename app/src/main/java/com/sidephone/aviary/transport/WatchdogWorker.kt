@@ -20,7 +20,9 @@ class WatchdogWorker(context: Context, params: WorkerParameters) : CoroutineWork
     override suspend fun doWork(): Result {
         ReceiveService.start(applicationContext)
         // Opportunistic housekeeping while we're awake: keep the media cache under budget.
-        runCatching { com.sidephone.aviary.data.MediaStore(applicationContext).enforceBudget() }
+        runCatching { (applicationContext as com.sidephone.aviary.RelayApp).let { app ->
+            app.mediaStore.enforceBudget(protectedPaths = app.repository.pendingAttachmentPaths())
+        } }
         return Result.success()
     }
 

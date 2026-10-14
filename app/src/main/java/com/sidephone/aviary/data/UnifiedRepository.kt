@@ -248,6 +248,13 @@ class UnifiedRepository(private val db: AviaryDatabase) {
     }
 
     /** Outgoing messages that failed to send — the offline outbox, oldest first. */
+    suspend fun recoverInterruptedSends(startedAt: Long) = db.messages().recoverInterruptedSends(startedAt)
+
+    suspend fun pendingAttachmentPaths(): Set<String> =
+        (db.messages().outgoingWithStatus(MessageStatus.PENDING) +
+            db.messages().outgoingWithStatus(MessageStatus.FAILED))
+            .mapNotNull { it.mediaPath }.toSet()
+
     suspend fun failedOutgoing(): List<MessageEntity> =
         db.messages().outgoingWithStatus(MessageStatus.FAILED)
 

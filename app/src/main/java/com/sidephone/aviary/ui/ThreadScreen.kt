@@ -99,6 +99,7 @@ import com.sidephone.aviary.data.isGroup
 import com.sidephone.aviary.data.displayTitle
 import com.sidephone.aviary.data.mediaLabel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 
 /** How many messages a thread loads at a time (initial page + each scroll-up expansion). */
 private const val PAGE_SIZE = 50
@@ -238,41 +239,35 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
     }
 
     val context = androidx.compose.ui.platform.LocalContext.current
+    fun sendPickedAttachment(uri: android.net.Uri) {
+        val c = convo ?: return
+        val caption = draft.trim()
+        scope.launch {
+            try {
+                val (file, type, name) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val type = context.contentResolver.getType(uri)
+                    val file = context.contentResolver.openInputStream(uri)?.use {
+                        com.sidephone.aviary.data.MediaStore(context).importStream(it, type)
+                    } ?: error("Couldn't open attachment")
+                    Triple(file, type, displayName(context, uri))
+                }
+                // The upload belongs to the app, not this composable's lifetime. Navigating
+                // away must not cancel the final status update and strand a PENDING row.
+                val result = app.appScope.async(kotlinx.coroutines.Dispatchers.IO) {
+                    app.router.resolve(c).sendMediaFile(c, file, type, name, caption)
+                }.await()
+                result.onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
+                if (result.isSuccess && draft.trim() == caption) draft = ""
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { snackbar.showSnackbar(e.message ?: "Couldn't read attachment") }
+        }
+    }
     val pickMedia = rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        val c = convo ?: return@rememberLauncherForActivityResult
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            val (bytes, type) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                val data = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                data to context.contentResolver.getType(uri)
-            }
-            if (bytes == null) return@launch
-            // Route media the same way as text: iMessage when the number is reachable, else SMS/MMS.
-            app.router.resolve(c)
-                .sendMedia(c, bytes, type, null, draft.trim())
-                .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
-            draft = ""
-        }
-    }
+    ) { uri -> if (uri != null) sendPickedAttachment(uri) }
     val pickFile = rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.GetContent()
-    ) { uri ->
-        val c = convo ?: return@rememberLauncherForActivityResult
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            val (bytes, type, name) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                val data = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                Triple(data, context.contentResolver.getType(uri), displayName(context, uri))
-            }
-            if (bytes == null) return@launch
-            app.router.resolve(c)
-                .sendMedia(c, bytes, type, name, draft.trim())
-                .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't send attachment") }
-            draft = ""
-        }
-    }
+    ) { uri -> if (uri != null) sendPickedAttachment(uri) }
     var attachMenuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<String?>(null) }
     // On this screen the on-screen keyboard leaves room for the composer and almost nothing else,
@@ -611,11 +606,8 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                                         forwarding = null
                                         scope.launch {
                                             if (fwdMsg.mediaPath != null) {
-                                                val bytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                                    runCatching { java.io.File(fwdMsg.mediaPath).readBytes() }.getOrNull()
-                                                }
-                                                if (bytes != null) app.router.resolve(target)
-                                                    .sendMedia(target, bytes, fwdMsg.mediaType, null, fwdMsg.body)
+                                                app.router.resolve(target)
+                                                    .sendMediaFile(target, java.io.File(fwdMsg.mediaPath), fwdMsg.mediaType, null, fwdMsg.body)
                                                     .onFailure { snackbar.showSnackbar(it.message ?: "Forward failed") }
                                             } else {
                                                 app.router.resolve(target).sendText(target, fwdMsg.body)

@@ -46,7 +46,10 @@ object SignalTrust {
         val (factory, trustManager) = trust(context)
         return OkHttpClient.Builder()
             .sslSocketFactory(factory, trustManager)
-            .readTimeout(0, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(60, TimeUnit.SECONDS)
             .build()
     }
 }

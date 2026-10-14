@@ -107,7 +107,7 @@ class RelayApp : Application(), coil.ImageLoaderFactory {
         // Auto-retry messages that failed to send, when the network returns.
         outbox.start()
         // Keep the attachment cache under budget (evict oldest media).
-        appScope.launch { runCatching { mediaStore.enforceBudget() } }
+        appScope.launch { runCatching { mediaStore.enforceBudget(protectedPaths = repository.pendingAttachmentPaths()) } }
         // Keep the process alive in the background so notifications stay reliable.
         com.sidephone.aviary.transport.ReceiveService.start(this)
         // Watchdog: restart the receive service if the OEM battery manager kills it.

@@ -478,20 +478,37 @@ class IMessageTransport(
     }
 
     override suspend fun sendMedia(
+        conversation: ConversationEntity, media: ByteArray, contentType: String?,
+        fileName: String?, caption: String,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val file = mediaStore.importStream(media.inputStream(), contentType)
+            sendMediaFile(conversation, file, contentType, fileName, caption)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
+    }
+
+    override suspend fun sendMediaFile(
         conversation: ConversationEntity,
-        media: ByteArray,
+        file: java.io.File,
         contentType: String?,
         fileName: String?,
         caption: String,
     ): Result<Unit> = withContext(Dispatchers.IO) {
         // The recipient's iPhone renders inline off the UTI + filename extension, so resolve a real
         // MIME (sniff bytes if the picker gave a generic one) and give it a proper name.
-        val mime = com.sidephone.aviary.data.MediaSniff.resolveMime(contentType, media)
+        val localFile: java.io.File
+        val mime: String
+        try {
+            val header = file.inputStream().use { com.sidephone.aviary.data.AttachmentStreams.prefix(it, 32) }
+            mime = com.sidephone.aviary.data.MediaSniff.resolveMime(contentType, header)
+            localFile = mediaStore.importFile(file, mime)
+        } catch (e: Exception) { return@withContext Result.failure(e) }
         val sendName = com.sidephone.aviary.data.MediaSniff.fileName(mime, fileName)
         val guid = java.util.UUID.randomUUID().toString().uppercase()
         seenGuids.add(guid) // echoes back on our own devices; don't re-insert
         // Optimistic: keep a local copy so the bubble renders immediately.
-        val localPath = runCatching { mediaStore.save(media, mime) }.getOrNull()
+        val localPath = localFile.absolutePath
         val rowId = repo.recordMessage(
             MessageEntity(
                 conversationId = conversation.id,
@@ -506,12 +523,9 @@ class IMessageTransport(
                 mediaType = mime,
             )
         )
-        // The native uploader (MMCS) reads from a file path; hand it a temp file.
-        val tmp = java.io.File.createTempFile("imsend", null, context.cacheDir)
-            .apply { writeBytes(media) }
         try {
             val res = json(ImessageNative.nativeSendMedia(
-                participantsJson(conversation), tmp.absolutePath, mime,
+                participantsJson(conversation), localPath, mime,
                 sendName, caption, guid,
             ))
             if (res.optBoolean("ok")) {
@@ -519,7 +533,7 @@ class IMessageTransport(
                 Result.success(Unit)
             } else {
                 smsFallback(conversation, rowId, guid)
-                    ?.sendMedia(conversation, media, contentType, fileName, caption)
+                    ?.sendMediaFile(conversation, localFile, contentType, fileName, caption)
                     ?: run {
                         repo.setMessageStatus(rowId, MessageStatus.FAILED)
                         Result.failure(Exception(res.optString("error", "send failed")))
@@ -529,8 +543,6 @@ class IMessageTransport(
             Log.e(TAG, "sendMedia: threw", e)
             repo.setMessageStatus(rowId, MessageStatus.FAILED)
             Result.failure(e)
-        } finally {
-            tmp.delete()
         }
     }
 
@@ -542,19 +554,18 @@ class IMessageTransport(
         val guid = message.externalId
             ?: java.util.UUID.randomUUID().toString().uppercase().also { seenGuids.add(it) }
         val res = if (message.mediaPath != null) {
-            val bytes = runCatching { java.io.File(message.mediaPath).readBytes() }.getOrNull()
-            if (bytes == null) {
-                repo.setMessageStatus(message.id, MessageStatus.FAILED)
-                return@withContext Result.failure(IllegalStateException("attachment file missing"))
-            }
-            val mime = com.sidephone.aviary.data.MediaSniff.resolveMime(message.mediaType, bytes)
-            val sendName = com.sidephone.aviary.data.MediaSniff.fileName(mime, null)
-            val tmp = java.io.File.createTempFile("imsend", null, context.cacheDir).apply { writeBytes(bytes) }
+            val file = java.io.File(message.mediaPath)
             try {
+                val header = file.inputStream().use { com.sidephone.aviary.data.AttachmentStreams.prefix(it, 32) }
+                val mime = com.sidephone.aviary.data.MediaSniff.resolveMime(message.mediaType, header)
+                val sendName = com.sidephone.aviary.data.MediaSniff.fileName(mime, null)
                 json(ImessageNative.nativeSendMedia(
-                    participantsJson(conversation), tmp.absolutePath, mime, sendName, message.body, guid,
+                    participantsJson(conversation), file.absolutePath, mime, sendName, message.body, guid,
                 ))
-            } finally { tmp.delete() }
+            } catch (e: Exception) {
+                repo.setMessageStatus(message.id, MessageStatus.FAILED)
+                return@withContext Result.failure(e)
+            }
         } else {
             json(ImessageNative.nativeSendText(
                 participantsJson(conversation), message.body, message.replyToExternalId ?: "", guid,

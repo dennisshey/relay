@@ -23,6 +23,9 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.coroutines.sync.withLock
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.net.URLEncoder
@@ -78,6 +81,40 @@ class SignalTransport(
     /** libsignal state, shared by the receive and send paths. Built once linked. */
     private val store: AviaryProtocolStore by lazy {
         AviaryProtocolStore(context, account.identity(SignalAccount.KIND_ACI)!!, account.aciRegistrationId)
+    }
+
+    private val noChallenge = MutableStateFlow<String?>(null)
+    internal val verificationChallenge: StateFlow<String?>
+        get() = if (account.isRegistered) store.challenge.state else noChallenge
+    override val sendingPaused: Boolean get() = verificationChallenge.value != null
+    private val verificationLock = kotlinx.coroutines.sync.Mutex()
+
+    internal suspend fun verifyCaptcha(callback: String): Result<Unit> = withContext(Dispatchers.IO) {
+        verificationLock.withLock {
+            try {
+                val challenge = verificationChallenge.value ?: error("No Signal verification is pending")
+                check(challenge.isNotBlank()) { "Signal returned an unsupported verification challenge" }
+                val captcha = SignalChallenge.captchaToken(callback) ?: error("Invalid CAPTCHA response")
+                val body = org.json.JSONObject().put("type", "captcha").put("token", challenge)
+                    .put("captcha", captcha).toString()
+                val request = Request.Builder().url("https://chat.signal.org/v1/challenge")
+                    .header("Authorization", "Basic ${account.authToken()}")
+                    .put(body.toRequestBody("application/json".toMediaType())).build()
+                SignalTrust.okHttpClient(context).newCall(request).execute().use { response ->
+                    check(response.isSuccessful) {
+                        when (response.code) {
+                            429 -> "Signal asks you to wait before verifying again. Sending remains paused."
+                            428 -> "Signal rejected this verification. Please try a new CAPTCHA."
+                            else -> "Verification failed (HTTP ${response.code}). Sending remains paused."
+                        }
+                    }
+                }
+                store.challenge.accepted(challenge)
+                Log.i("SignalDelivery", "stage=verification-accepted")
+                Result.success(Unit)
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { Result.failure(e) }
+        }
     }
 
     override suspend fun start() {
@@ -163,7 +200,7 @@ class SignalTransport(
         // update the status when the network call resolves.
         val ts = System.currentTimeMillis()
         val externalId = "out:$ts"
-        Log.i("SignalReply", "SEND ts=$ts extId=$externalId body='${recordBody.take(24)}'")
+        Log.i("SignalDelivery", "ts=$ts stage=start group=${conversation.externalId.startsWith("group:")}")
         // An inline reply carries a Quote naming the target's author + sent timestamp.
         val quote = replyTo?.let {
             val authorAci = if (it.outgoing) account.aci else it.sender
@@ -204,7 +241,7 @@ class SignalTransport(
                 ID, externalId,
                 if (sent.isSuccess) MessageStatus.SENT else MessageStatus.FAILED,
             )
-            sent
+            sent.onFailure { SignalDiagnostics.failure("send-result", ts, it) }
         }
     }
 
@@ -289,8 +326,19 @@ class SignalTransport(
     }
 
     override suspend fun sendMedia(
+        conversation: ConversationEntity, media: ByteArray, contentType: String?,
+        fileName: String?, caption: String,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val file = mediaStore.importStream(media.inputStream(), contentType)
+            sendMediaFile(conversation, file, contentType, fileName, caption)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
+    }
+
+    override suspend fun sendMediaFile(
         conversation: ConversationEntity,
-        media: ByteArray,
+        file: java.io.File,
         contentType: String?,
         fileName: String?,
         caption: String,
@@ -299,7 +347,11 @@ class SignalTransport(
         val ts = System.currentTimeMillis()
         val externalId = "out:$ts"
         // Optimistic: store a local copy and show the message immediately.
-        val localPath = runCatching { mediaStore.save(media, contentType) }.getOrNull()
+        val localFile = try {
+            withContext(Dispatchers.IO) { mediaStore.importFile(file, contentType) }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { return Result.failure(e) }
+        val localPath = localFile.absolutePath
         repo.recordMessage(
             MessageEntity(
                 conversationId = conversation.id, transportId = ID, externalId = externalId,
@@ -314,9 +366,9 @@ class SignalTransport(
                 val group = SignalGroups(SignalTrust.okHttpClient(context))
                     .fetch(account.authToken(), account.aci!!, account.pni!!, masterKey)
                 if (group.memberAcis.isEmpty()) Result.failure(IllegalStateException("Couldn't load group members"))
-                else sender.sendMediaGroup(masterKey, group, media, contentType, fileName, caption, ts)
+                else sender.sendMediaGroup(masterKey, group, localFile, contentType, fileName, caption, ts)
             } else {
-                sender.sendMediaDirect(conversation.externalId, media, contentType, fileName, caption, ts)
+                sender.sendMediaDirect(conversation.externalId, localFile, contentType, fileName, caption, ts)
             }
             repo.setStatusByExternal(ID, externalId, if (sent.isSuccess) MessageStatus.SENT else MessageStatus.FAILED)
             sent
@@ -388,7 +440,11 @@ class SignalTransport(
                 Base64.decode(conversation.externalId.removePrefix("group:"), Base64.NO_WRAP) else null
             val group = if (isGroup) SignalGroups(SignalTrust.okHttpClient(context))
                 .fetch(account.authToken(), account.aci!!, account.pni!!, masterKey!!) else null
-            val media = message.mediaPath?.let { runCatching { java.io.File(it).readBytes() }.getOrNull() }
+            val media = message.mediaPath?.let { java.io.File(it) }
+            if (media != null && !media.isFile) {
+                repo.setMessageStatus(message.id, MessageStatus.FAILED)
+                return@withContext Result.failure(IllegalStateException("Attachment file missing"))
+            }
             // Reply-quote is dropped on retry (target reconstruction isn't stored); text/media kept.
             val sent: Result<Unit> = when {
                 media != null && isGroup ->

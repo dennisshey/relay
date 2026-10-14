@@ -322,6 +322,9 @@ interface MessageDao {
     @Query("SELECT externalId FROM messages WHERE conversationId = :conversationId AND outgoing = 0 AND externalId IS NOT NULL ORDER BY timestamp DESC, id DESC LIMIT 1")
     suspend fun latestIncomingExternalId(conversationId: Long): String?
 
+    @Query("UPDATE messages SET status = 'FAILED' WHERE outgoing = 1 AND status = 'PENDING' AND timestamp < :startedAt AND transportId IN ('signal', 'imessage')")
+    suspend fun recoverInterruptedSends(startedAt: Long)
+
     /** The offline outbox: outgoing messages that failed to send, oldest first, for auto-retry. */
     @Query("SELECT * FROM messages WHERE outgoing = 1 AND status = :status ORDER BY timestamp ASC, id ASC")
     suspend fun outgoingWithStatus(status: MessageStatus): List<MessageEntity>

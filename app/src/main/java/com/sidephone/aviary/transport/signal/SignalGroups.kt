@@ -35,7 +35,7 @@ class SignalGroups(
         val revision: Int = 0,
     )
 
-    fun fetch(authToken: String, aci: String, pni: String, masterKey: ByteArray): Info =
+    fun fetch(authToken: String, aci: String, pni: String, masterKey: ByteArray, includeAvatar: Boolean = false): Info =
         runCatching {
             val secretParams = GroupSecretParams.deriveFromMasterKey(GroupMasterKey(masterKey))
             val serverParams = ServerPublicParams(Base64.decode(SERVER_PUBLIC_PARAMS, Base64.NO_WRAP))
@@ -67,13 +67,14 @@ class SignalGroups(
                 // GroupAttributeBlob.title = 1
                 MiniProto.stringField(MiniProto.parse(cipher.decryptBlob(it)), 1)
             }?.takeIf { it.isNotBlank() }
-            val avatar = MiniProto.stringField(groupProto, 3)?.takeIf { it.isNotBlank() }
+            val avatar = if (!includeAvatar) null else MiniProto.stringField(groupProto, 3)?.takeIf { it.isNotBlank() }
                 ?.let { downloadAvatar(it, cipher) }
             val revision = MiniProto.varintField(groupProto, 6)?.toInt() ?: 0
             // Group.members = 7 (repeated); Member.userId = 1 (encrypted UuidCiphertext).
-            val members = groupProto.filter { it.number == 7 }.mapNotNull { field ->
-                field.bytes?.let { MiniProto.bytesField(MiniProto.parse(it), 1) }
-                    ?.let { runCatching { cipher.decrypt(UuidCiphertext(it)).rawUUID.toString() }.getOrNull() }
+            val members = groupProto.filter { it.number == 7 }.map { field ->
+                val member = field.bytes ?: error("Invalid group member")
+                val userId = MiniProto.bytesField(MiniProto.parse(member), 1) ?: error("Missing group member id")
+                cipher.decrypt(UuidCiphertext(userId)).rawUUID.toString()
             }
             Info(title, avatar, members, revision)
         }.onFailure { Log.w("SignalGroups", "group fetch failed: ${it.message}") }

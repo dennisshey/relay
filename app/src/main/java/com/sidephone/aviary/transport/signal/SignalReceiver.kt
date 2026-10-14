@@ -10,6 +10,7 @@ import com.sidephone.aviary.data.MessageStatus
 import com.sidephone.aviary.data.UnifiedRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -36,6 +37,7 @@ import org.signal.libsignal.protocol.message.PreKeySignalMessage
 import org.signal.libsignal.protocol.message.SenderKeyDistributionMessage
 import org.signal.libsignal.protocol.message.SignalMessage
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Authenticated receive loop for the linked Signal device. Opens the chat websocket,
@@ -60,9 +62,11 @@ class SignalReceiver(
     private val certificateValidator = CertificateValidator(TRUST_ROOTS.map {
         ECPublicKey(Base64.decode(it, Base64.NO_WRAP))
     })
-    private var socket: WebSocket? = null
+    @Volatile private var socket: WebSocket? = null
     private var keepAliveJob: Job? = null
     private var reconnectJob: Job? = null
+    private val keepAliveIds = AtomicLong(0)
+    private val inboundSequence = AtomicLong(0)
     @Volatile private var stopped = false
     @Volatile private var diagnosticsRun = false
 
@@ -71,6 +75,7 @@ class SignalReceiver(
         connect()
     }
 
+    @Synchronized
     private fun connect() {
         if (stopped) return
         if (account.password == null) return
@@ -88,14 +93,21 @@ class SignalReceiver(
         socket = client.newWebSocket(
             request,
             object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
+                override fun onOpen(webSocket: WebSocket, response: Response) = synchronized(this@SignalReceiver) {
+                    // A superseded socket can finish its handshake after a replacement was made.
+                    // Never let it announce connectivity or start a second keepalive loop.
+                    if (socket !== webSocket || stopped) {
+                        webSocket.cancel()
+                        return
+                    }
+                    inboundSequence.incrementAndGet()
                     Log.i(TAG, "receive websocket open"); onConnected(true)
                     startKeepAlive(webSocket)
                     if (!diagnosticsRun) {
                         diagnosticsRun = true
                         topUpPreKeysIfLow()
                         backfillNames()
-                        scope.launch {
+                        scope.launch(Dispatchers.IO) {
                             val who = runCatching {
                                 SignalApi(SignalTrust.okHttpClient(context))
                                     .debugGet(account.authToken(), "/v1/accounts/whoami")
@@ -106,23 +118,55 @@ class SignalReceiver(
                 }
 
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    scope.launch { handleFrame(webSocket, bytes.toByteArray()) }
+                    if (socket !== webSocket || stopped) return
+                    // Any inbound frame proves the full round trip is alive. This includes the
+                    // RESPONSE to /v1/keepalive, message envelopes, and empty-queue markers.
+                    inboundSequence.incrementAndGet()
+                    scope.launch(Dispatchers.IO) { handleFrame(webSocket, bytes.toByteArray()) }
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(code, reason)
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    Log.i(TAG, "receive websocket closed $code $reason"); onConnected(false)
-                    scheduleReconnect()
+                    handleSocketDeath(webSocket, "closed $code $reason")
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    Log.w(TAG, "receive websocket failure: ${t.message}"); onConnected(false)
-                    scheduleReconnect()
+                    handleSocketDeath(webSocket, "failure: ${t.message}", t)
                 }
             },
         )
     }
 
+    /** Retire only the currently active socket; late callbacks from old sockets are ignored. */
+    @Synchronized
+    private fun handleSocketDeath(ws: WebSocket, reason: String, error: Throwable? = null) {
+        if (socket !== ws) return
+        socket = null
+        keepAliveJob?.cancel(); keepAliveJob = null
+        if (error != null) Log.w(TAG, "receive websocket $reason", error)
+        else Log.i(TAG, "receive websocket $reason")
+        onConnected(false)
+        scheduleReconnect()
+    }
+
+    /** A locally writable but remotely dead socket needs an explicit cancel before replacement. */
+    private fun retireStaleSocket(ws: WebSocket, reason: String) {
+        synchronized(this) {
+            if (socket !== ws || stopped) return
+            socket = null
+            keepAliveJob?.cancel(); keepAliveJob = null
+        }
+        Log.w(TAG, "receive websocket stale: $reason")
+        onConnected(false)
+        ws.cancel()
+        scheduleReconnect()
+    }
+
     /** Reconnect with a short fixed backoff (Signal drops idle/roamed sockets). */
+    @Synchronized
     private fun scheduleReconnect() {
         keepAliveJob?.cancel()
         if (stopped || reconnectJob?.isActive == true) return
@@ -136,12 +180,14 @@ class SignalReceiver(
         stopped = true
         reconnectJob?.cancel(); reconnectJob = null
         keepAliveJob?.cancel(); keepAliveJob = null
-        socket?.close(1000, "stop"); socket = null
+        val old = socket
+        socket = null
+        old?.close(1000, "stop")
     }
 
     /** Refill one-time prekeys when the server's supply runs low. */
     private fun topUpPreKeysIfLow() {
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             val api = SignalApi(SignalTrust.okHttpClient(context))
             val auth = account.authToken()
             val count = runCatching {
@@ -162,19 +208,32 @@ class SignalReceiver(
 
     /**
      * Signal keeps a client websocket alive with a periodic application-level
-     * request to /v1/keepalive (not a WebSocket ping). ~50s stays under the
-     * server's idle window.
+     * request to /v1/keepalive (not a WebSocket ping). Merely getting `true` from send() only
+     * means OkHttp accepted bytes into its local queue; a half-open mobile connection can do that
+     * indefinitely while Signal queues messages. Require an inbound frame after every probe and
+     * replace the socket if the round trip misses its deadline.
      */
     private fun startKeepAlive(ws: WebSocket) {
         keepAliveJob?.cancel()
         keepAliveJob = scope.launch {
             while (isActive) {
-                delay(50_000)
+                if (socket !== ws || stopped) return@launch
+                val inboundBefore = inboundSequence.get()
+                val requestId = keepAliveIds.incrementAndGet()
                 val req = MiniProto.Writer()
-                    .string(1, "GET").string(2, "/v1/keepalive").varint(4, 1)
+                    .string(1, "GET").string(2, "/v1/keepalive").varint(4, requestId)
                     .toByteArray()
                 val frame = MiniProto.Writer().varint(1, 1).bytes(2, req).toByteArray()
-                if (!ws.send(frame.toByteString())) break
+                if (!ws.send(frame.toByteString())) {
+                    retireStaleSocket(ws, "keepalive send rejected")
+                    return@launch
+                }
+                delay(KEEPALIVE_TIMEOUT_MS)
+                if (socket === ws && inboundSequence.get() == inboundBefore) {
+                    retireStaleSocket(ws, "no keepalive response in ${KEEPALIVE_TIMEOUT_MS}ms")
+                    return@launch
+                }
+                delay(KEEPALIVE_INTERVAL_MS - KEEPALIVE_TIMEOUT_MS)
             }
         }
     }
@@ -201,7 +260,7 @@ class SignalReceiver(
         val type = MiniProto.varintField(env, 1)?.toInt() ?: return
         // Server delivery receipt: no content; clientTimestamp (5) is our message's ts.
         if (type == TYPE_RECEIPT) {
-            MiniProto.varintField(env, 5)?.let { repo.markDelivered(SignalTransport.ID, "out:$it") }
+            MiniProto.varintField(env, 5)?.let { if (!store.hasPendingGroup(it)) repo.markDelivered(SignalTransport.ID, "out:$it") }
             return
         }
         val content = MiniProto.bytesField(env, 8) ?: return
@@ -221,7 +280,7 @@ class SignalReceiver(
         var senderDevice = sourceDevice
 
         val plaintext: ByteArray = try {
-            when (type) {
+            synchronized(store) { when (type) {
                 TYPE_DOUBLE_RATCHET -> {
                     val addr = SignalProtocolAddress(sourceServiceId ?: return, sourceDevice)
                     SessionCipher(store, addr).decrypt(SignalMessage(content))
@@ -241,7 +300,7 @@ class SignalReceiver(
                     result.paddedMessage
                 }
                 else -> return
-            }
+            } }
         } catch (e: Exception) {
             maybeSendRetryReceipt(type, content, sourceServiceId, sourceDevice, sentTimestamp, e)
             throw e
@@ -257,9 +316,9 @@ class SignalReceiver(
             val type = MiniProto.varintField(rm, 1) ?: 0L
             val timestamps = rm.filter { it.number == 2 }.mapNotNull { it.varint }
             when (type) {
-                0L -> timestamps.forEach { repo.markDelivered(SignalTransport.ID, "out:$it") } // DELIVERY
+                0L -> timestamps.forEach { if (!store.hasPendingGroup(it)) repo.markDelivered(SignalTransport.ID, "out:$it") } // DELIVERY
                 1L -> timestamps.forEach { // READ
-                    repo.advanceStatusByExternal(SignalTransport.ID, "out:$it", MessageStatus.READ)
+                    if (!store.hasPendingGroup(it)) repo.advanceStatusByExternal(SignalTransport.ID, "out:$it", MessageStatus.READ)
                 }
             }
             return
@@ -282,7 +341,7 @@ class SignalReceiver(
         // field 7); process it so subsequent sender-key group messages decrypt.
         MiniProto.bytesField(contentProto, 7)?.let { skdm ->
             runCatching {
-                GroupSessionBuilder(store).process(senderAddress, SenderKeyDistributionMessage(skdm))
+                synchronized(store) { GroupSessionBuilder(store).process(senderAddress, SenderKeyDistributionMessage(skdm)) }
             }.onFailure { Log.w(TAG, "SKDM process failed: ${it.message}") }
         }
 
@@ -403,7 +462,7 @@ class SignalReceiver(
         val aci = senderAci ?: return
         if (!retriedEnvelopes.add("$aci.$senderDevice:$sentTimestamp")) return // once per message
         Log.i(TAG, "decrypt failed (${error.javaClass.simpleName}); retry receipt -> $aci.$senderDevice")
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             SignalSender(store, account, SignalTrust.okHttpClient(context))
                 .sendRetryReceipt(
                     aci, senderDevice, ciphertextType, ciphertext, sentTimestamp,
@@ -479,9 +538,11 @@ class SignalReceiver(
         if (attachment != null) {
             val attachments = SignalAttachments(SignalTrust.okHttpClient(context))
             val pointer = attachments.parse(attachment)
-            attachments.download(pointer)?.let { bytes ->
-                mediaPath = mediaStore.save(bytes, pointer.contentType)
-                mediaType = pointer.contentType
+            attachments.download(pointer, context.cacheDir)?.let { file ->
+                try {
+                    mediaPath = mediaStore.importFile(file, pointer.contentType).absolutePath
+                    mediaType = pointer.contentType
+                } finally { file.delete() }
             }
         }
 
@@ -662,7 +723,7 @@ class SignalReceiver(
 
     /** Fetch the sender's profile name + avatar; rename their 1:1 thread. */
     private fun resolveName(aci: String, profileKey: ByteArray) {
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             val info = SignalProfile(SignalTrust.okHttpClient(context))
                 .fetch(account.authToken(), aci, profileKey)
             info.avatar?.let { avatarStore.save(aci, it) }
@@ -678,7 +739,7 @@ class SignalReceiver(
      * group titles (we have the master key in the id) and 1:1 names already known.
      */
     private fun backfillNames() {
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             repo.conversationsForTransport(SignalTransport.ID).forEach { convo ->
                 when {
                     convo.externalId.startsWith("group:") &&
@@ -701,9 +762,9 @@ class SignalReceiver(
     private fun resolveGroupName(masterKey: ByteArray, convoId: Long, externalId: String) {
         val aci = account.aci ?: return
         val pni = account.pni ?: return
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             val info = SignalGroups(SignalTrust.okHttpClient(context))
-                .fetch(account.authToken(), aci, pni, masterKey)
+                .fetch(account.authToken(), aci, pni, masterKey, includeAvatar = true)
             info.avatar?.let { avatarStore.save(externalId, it) }
             info.title?.let { repo.setConversationTitle(convoId, it) }
         }
@@ -750,6 +811,8 @@ class SignalReceiver(
             Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
         private const val CHAT_WS = "wss://chat.signal.org"
         private const val USER_AGENT = "Relay/0.1 (Android; linked-device)"
+        private const val KEEPALIVE_INTERVAL_MS = 20_000L
+        private const val KEEPALIVE_TIMEOUT_MS = 10_000L
 
         private const val PREKEY_LOW_THRESHOLD = 20
         private const val TYPE_DOUBLE_RATCHET = 1

@@ -71,13 +71,7 @@ class SignalSender(
                 .varint(2, group.revision.toLong()).toByteArray()
             val edit = editMessage(targetTimestamp, dataMessage(body, ts, groupContext))
             val padded = contentEdit(edit)
-            var anySent = false
-            group.memberAcis.filter { it != account.aci }.forEach { member ->
-                sendContent(member, padded, ts, null)
-                    .onSuccess { anySent = true }
-                    .onFailure { Log.w(TAG, "group edit to $member failed: ${it.message}") }
-            }
-            check(anySent) { "could not deliver the edit to any group member" }
+            sendGroupContent(masterKey, group, ts, "edit") { padded }
             syncSentEdit(edit, ts, null)
         }
 
@@ -91,24 +85,41 @@ class SignalSender(
                 .varint(2, group.revision.toLong()).toByteArray()
             val dataMessage = dataMessage(body, ts, groupContext, quote, mentions)
             val padded = content(dataMessage)
-            val self = account.aci
-            var anySent = false
-            group.memberAcis.filter { it != self }.forEach { member ->
-                sendContent(member, padded, ts, null)
-                    .onSuccess { anySent = true }
-                    .onFailure { Log.w(TAG, "group send to $member failed: ${it.message}") }
-            }
-            check(anySent) { "could not deliver to any group member" }
-            syncSent(dataMessage, ts, null)
+            val delivered = sendGroupContent(masterKey, group, ts, "message") { padded }
+            syncSent(MiniProto.bytesField(MiniProto.parse(unpad(delivered)), 1)!!, ts, null)
         }
+
+    private fun sendGroupContent(
+        masterKey: ByteArray, group: SignalGroups.Info, ts: Long, kind: String,
+        makeContent: () -> ByteArray,
+    ): ByteArray {
+        val key = "group-send.$ts.$kind.${Base64.encodeToString(masterKey, Base64.NO_WRAP)}"
+        return synchronized(store.groupSendLock(key)) {
+            val state = store.groupDelivery(key) ?: GroupDelivery(
+                makeContent(), group.memberAcis.filter { it != account.aci }.toSet(),
+            ).also {
+                check(it.recipients.isNotEmpty()) { "No group recipients" }
+                store.saveGroupDelivery(key, it)
+            }
+            // Never send historical content to newly added members; stop retrying removed members.
+            Log.i("SignalDelivery", "ts=$ts stage=group recipients=${state.recipients.size} accepted=${state.accepted.size} pending=${state.pending.size}")
+            state.deliver(group.memberAcis.toSet(), { store.saveGroupDelivery(key, it) }) { member, content ->
+                sendContent(member, content, ts, null)
+                    .onFailure { SignalDiagnostics.failure("group-recipient", ts, it) }
+                    .onSuccess { Log.i("SignalDelivery", "ts=$ts stage=recipient-accepted") }
+            }
+            state.content
+        }
+    }
 
     /** Send a 1:1 message with a media attachment. */
     fun sendMediaDirect(
-        recipientAci: String, media: ByteArray, contentType: String?, fileName: String?,
+        recipientAci: String, media: java.io.File, contentType: String?, fileName: String?,
         caption: String, ts: Long,
     ): Result<Unit> = runCatching {
-        val pointer = SignalAttachments(client).upload(account.authToken(), media, contentType, fileName)
-            ?: error("attachment upload failed")
+        val pointer = SignalAttachments(client.newBuilder().readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(30, java.util.concurrent.TimeUnit.MINUTES).build()).upload(account.authToken(), media, contentType, fileName)
         val dm = mediaDataMessage(caption, ts, null, pointer)
         sendContent(recipientAci, content(dm), ts, null).getOrThrow()
         syncSent(dm, ts, recipientAci)
@@ -116,21 +127,25 @@ class SignalSender(
 
     /** Send a group message with a media attachment. */
     fun sendMediaGroup(
-        masterKey: ByteArray, group: SignalGroups.Info, media: ByteArray, contentType: String?,
+        masterKey: ByteArray, group: SignalGroups.Info, media: java.io.File, contentType: String?,
         fileName: String?, caption: String, ts: Long,
     ): Result<Unit> = runCatching {
-        val pointer = SignalAttachments(client).upload(account.authToken(), media, contentType, fileName)
-            ?: error("attachment upload failed")
-        val groupContext = MiniProto.Writer().bytes(1, masterKey)
-            .varint(2, group.revision.toLong()).toByteArray()
-        val dm = mediaDataMessage(caption, ts, groupContext, pointer)
-        val padded = content(dm)
-        var anySent = false
-        group.memberAcis.filter { it != account.aci }.forEach { member ->
-            sendContent(member, padded, ts, null).onSuccess { anySent = true }
-                .onFailure { Log.w(TAG, "group media send to $member failed: ${it.message}") }
+        var dataMessage: ByteArray? = null
+        val deliveredContent = sendGroupContent(masterKey, group, ts, "message") {
+            val pointer = SignalAttachments(client.newBuilder()
+                .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .callTimeout(30, java.util.concurrent.TimeUnit.MINUTES).build())
+                .upload(account.authToken(), media, contentType, fileName)
+            val groupContext = MiniProto.Writer().bytes(1, masterKey)
+                .varint(2, group.revision.toLong()).toByteArray()
+            val dm = mediaDataMessage(caption, ts, groupContext, pointer)
+            dataMessage = dm
+            content(dm)
         }
-        check(anySent) { "could not deliver to any group member" }
+        // Retry uses the original attachment pointer and exact message content.
+        val dm = dataMessage ?: MiniProto.bytesField(MiniProto.parse(unpad(deliveredContent)), 1)
+            ?: error("Missing group media content")
         syncSent(dm, ts, null)
     }
 
@@ -173,7 +188,7 @@ class SignalSender(
             .varint(2, group.revision.toLong()).toByteArray()
         val dm = reactionDataMessage(targetAuthorAci, targetTs, emoji, remove, ts, groupContext)
         val padded = content(dm)
-        group.memberAcis.filter { it != account.aci }.forEach { sendContent(it, padded, ts, null) }
+        sendGroupContent(masterKey, group, ts, "reaction") { padded }
         syncSent(dm, ts, null)
     }
 
@@ -259,44 +274,111 @@ class SignalSender(
         timestamp: Long,
         excludeDeviceId: Int?,
     ): Result<Unit> = runCatching {
-        val bundle = fetchPreKeys(recipientAci)
-        val identityKey = IdentityKey(Base64.decode(bundle.getString("identityKey"), Base64.NO_WRAP))
-        val devices = bundle.getJSONArray("devices")
-
-        val messages = JSONArray()
-        for (i in 0 until devices.length()) {
-            val d = devices.getJSONObject(i)
-            val deviceId = d.getInt("deviceId")
-            if (deviceId == excludeDeviceId) continue
-            val address = SignalProtocolAddress(recipientAci, deviceId)
-            if (!store.containsSession(address)) {
-                SessionBuilder(store, address).process(buildBundle(d, identityKey))
+        store.checkSendCooldown(recipientAci, "messages")
+        store.challenge.checkSendingAllowed()
+        var refreshDevices = false
+        repeat(3) { attempt ->
+            var deviceIds = synchronized(store) { store.sendingDevices(recipientAci) }
+            if (deviceIds.isEmpty() || refreshDevices) {
+                val bundle = fetchPreKeys(recipientAci)
+                val identityKey = IdentityKey(Base64.decode(bundle.getString("identityKey"), Base64.NO_WRAP))
+                val devices = bundle.getJSONArray("devices")
+                deviceIds = (0 until devices.length()).map { devices.getJSONObject(it).getInt("deviceId") }
+                synchronized(store) {
+                    // The server's refreshed list is authoritative; discard removed devices.
+                    for (old in store.sendingDevices(recipientAci) - deviceIds.toSet())
+                        store.deleteSession(SignalProtocolAddress(recipientAci, old))
+                    for (i in 0 until devices.length()) {
+                        val d = devices.getJSONObject(i)
+                        val deviceId = d.getInt("deviceId")
+                        if (deviceId == excludeDeviceId) continue
+                        val address = SignalProtocolAddress(recipientAci, deviceId)
+                        if (!store.containsSession(address) || !store.loadSession(address).hasSenderChain() ||
+                            store.loadSession(address).remoteRegistrationId != d.getInt("registrationId")) {
+                            store.deleteSession(address)
+                            SessionBuilder(store, address).process(buildBundle(d, identityKey))
+                        }
+                    }
+                }
             }
-            val ciphertext = SessionCipher(store, address).encrypt(paddedContent)
-            messages.put(JSONObject().apply {
-                put("type", if (ciphertext.type == CiphertextMessage.PREKEY_TYPE) 3 else 1)
-                put("destinationDeviceId", deviceId)
-                put("destinationRegistrationId", d.getInt("registrationId"))
-                put("content", Base64.encodeToString(ciphertext.serialize(), Base64.NO_WRAP))
-            })
-        }
-        if (messages.length() == 0) return@runCatching
+            val messages = JSONArray()
+            for (deviceId in deviceIds) {
+                if (deviceId == excludeDeviceId) continue
+                val address = SignalProtocolAddress(recipientAci, deviceId)
+                val (ciphertext, registrationId) = synchronized(store) {
+                    SessionCipher(store, address).encrypt(paddedContent) to store.loadSession(address).remoteRegistrationId
+                }
+                messages.put(JSONObject().apply {
+                    put("type", if (ciphertext.type == CiphertextMessage.PREKEY_TYPE) 3 else 1)
+                    put("destinationDeviceId", deviceId)
+                    put("destinationRegistrationId", registrationId)
+                    put("content", Base64.encodeToString(ciphertext.serialize(), Base64.NO_WRAP))
+                })
+            }
+            if (messages.length() == 0) {
+                check(excludeDeviceId != null) { "Recipient has no registered devices" }
+                return@runCatching
+            }
 
-        val payload = JSONObject().apply {
-            put("destination", recipientAci)
-            put("timestamp", timestamp)
-            put("online", false)
-            put("urgent", true)
-            put("messages", messages)
-        }
-        val request = Request.Builder()
-            .url("$baseUrl/v1/messages/$recipientAci")
-            .header("Authorization", "Basic ${account.authToken()}")
-            .put(payload.toString().toRequestBody(JSON))
-            .build()
-        client.newCall(request).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            check(resp.isSuccessful) { "send failed HTTP ${resp.code}: $text" }
+            val payload = JSONObject().apply {
+                put("destination", recipientAci)
+                put("timestamp", timestamp)
+                put("online", false)
+                put("urgent", true)
+                put("messages", messages)
+            }
+            val request = Request.Builder()
+                .url("$baseUrl/v1/messages/$recipientAci")
+                .header("Authorization", "Basic ${account.authToken()}")
+                .put(payload.toString().toRequestBody(JSON))
+                .build()
+            client.newCall(request).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                Log.i("SignalDelivery", "ts=$timestamp stage=message-http attempt=$attempt status=${resp.code}")
+                if (resp.code == 428) store.requireVerification(text)
+                if (resp.code == 429) store.deferSend(recipientAci, "messages", resp.header("Retry-After"))
+                if ((resp.code == 409 || resp.code == 410) && attempt < 2) {
+                    refreshDevices = true
+                    if (resp.code == 409) {
+                        val mismatch = JSONObject(text)
+                        val extra = mismatch.optJSONArray("extraDevices")
+                        val missing = mismatch.optJSONArray("missingDevices")
+                        Log.i("SignalDelivery", "ts=$timestamp stage=device-mismatch extra=${extra?.length() ?: 0} missing=${missing?.length() ?: 0}")
+                        synchronized(store) {
+                            if (extra != null) for (i in 0 until extra.length())
+                                store.deleteSession(SignalProtocolAddress(recipientAci, extra.getInt(i)))
+                        }
+                        // Fetch only newly linked devices, not every established device's prekeys.
+                        refreshDevices = missing == null
+                        if (missing != null) for (i in 0 until missing.length()) {
+                            val newDeviceId = missing.getInt(i)
+                            val keys = fetchPreKeys(recipientAci, newDeviceId)
+                            val identity = IdentityKey(Base64.decode(keys.getString("identityKey"), Base64.NO_WRAP))
+                            val bundles = keys.getJSONArray("devices")
+                            check(bundles.length() > 0) { "Missing device returned no prekeys" }
+                            synchronized(store) {
+                                for (j in 0 until bundles.length()) {
+                                    val device = bundles.getJSONObject(j)
+                                    check(device.getInt("deviceId") == newDeviceId)
+                                    SessionBuilder(store, SignalProtocolAddress(recipientAci, newDeviceId))
+                                        .process(buildBundle(device, identity))
+                                }
+                            }
+                        }
+                    }
+                    if (resp.code == 410) {
+                        val stale = JSONObject(text).optJSONArray("staleDevices")
+                        synchronized(store) {
+                            if (stale != null) for (i in 0 until stale.length()) {
+                                store.deleteSession(SignalProtocolAddress(recipientAci, stale.getInt(i)))
+                            }
+                        }
+                    }
+                    return@repeat
+                }
+                check(resp.isSuccessful) { "send failed HTTP ${resp.code}: $text" }
+            }
+            return@runCatching
         }
     }
 
@@ -387,14 +469,18 @@ class SignalSender(
             .onFailure { Log.w(TAG, "edit sent-sync failed: ${it.message}") }
     }
 
-    private fun fetchPreKeys(aci: String): JSONObject {
+    private fun fetchPreKeys(aci: String, deviceId: Int? = null): JSONObject {
+        store.challenge.checkSendingAllowed()
+        store.checkSendCooldown(aci, "keys")
         val request = Request.Builder()
-            .url("$baseUrl/v2/keys/$aci/*")
+            .url("$baseUrl/v2/keys/$aci/${deviceId ?: "*"}")
             .header("Authorization", "Basic ${account.authToken()}")
             .get()
             .build()
         client.newCall(request).execute().use { resp ->
             val text = resp.body?.string().orEmpty()
+            if (resp.code == 428) store.requireVerification(text)
+            if (resp.code == 429) store.deferSend(aci, "keys", resp.header("Retry-After"))
             check(resp.isSuccessful) { "prekey fetch HTTP ${resp.code}: $text" }
             return JSONObject(text)
         }
@@ -417,6 +503,13 @@ class SignalSender(
             KEMPublicKey(Base64.decode(pq.getString("publicKey"), Base64.NO_WRAP)),
             Base64.decode(pq.getString("signature"), Base64.NO_WRAP),
         )
+    }
+
+    private fun unpad(content: ByteArray): ByteArray {
+        var end = content.size - 1
+        while (end >= 0 && content[end] == 0.toByte()) end--
+        require(end >= 0 && content[end] == 0x80.toByte()) { "Invalid saved content padding" }
+        return content.copyOf(end)
     }
 
     /** Signal pads plaintext to a multiple of 160: message | 0x80 | 0x00*. */

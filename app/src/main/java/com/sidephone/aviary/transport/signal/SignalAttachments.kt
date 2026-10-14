@@ -1,19 +1,15 @@
 package com.sidephone.aviary.transport.signal
 
 import android.net.Uri
-import android.util.Base64
 import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
+import java.io.File
 import org.json.JSONObject
-import java.security.MessageDigest
 import java.security.SecureRandom
-import javax.crypto.Cipher
-import javax.crypto.Mac
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * Downloads and decrypts Signal message attachments. An attachment on the CDN is
@@ -49,37 +45,41 @@ class SignalAttachments(private val client: OkHttpClient) {
         )
     }
 
-    /** Download + verify + decrypt an attachment; returns the plaintext media bytes. */
-    fun download(pointer: Pointer): ByteArray? = runCatching {
-        val key = pointer.key ?: return null
-        if (key.size < 64) return null
-        val id = pointer.cdnKey?.let { Uri.encode(it) }
-            ?: pointer.cdnId?.toString() ?: return null
-        val url = "${cdnHost(pointer.cdnNumber)}/attachments/$id"
-
-        val encrypted = client.newCall(Request.Builder().url(url).get().build()).execute()
-            .use { resp -> if (!resp.isSuccessful) return null else resp.body?.bytes() ?: return null }
-
-        if (encrypted.size < 16 + 32) return null
-        pointer.digest?.let { digest ->
-            if (!MessageDigest.isEqual(MessageDigest.getInstance("SHA-256").digest(encrypted), digest)) {
-                Log.w(TAG, "attachment digest mismatch"); return null
-            }
-        }
-        val aesKey = key.copyOfRange(0, 32)
-        val macKey = key.copyOfRange(32, 64)
-        val theirMac = encrypted.copyOfRange(encrypted.size - 32, encrypted.size)
-        val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(macKey, "HmacSHA256")) }
-            .doFinal(encrypted.copyOfRange(0, encrypted.size - 32))
-        if (!MessageDigest.isEqual(mac, theirMac)) { Log.w(TAG, "attachment MAC mismatch"); return null }
-
-        val iv = encrypted.copyOfRange(0, 16)
-        val ciphertext = encrypted.copyOfRange(16, encrypted.size - 32)
-        val plain = Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
-            init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
-        }.doFinal(ciphertext)
-        // Plaintext is bucket-padded; the pointer's size is the real length.
-        if (pointer.size in 1..plain.size) plain.copyOf(pointer.size) else plain
+    /** Download, authenticate and decrypt without whole-file allocations. Caller owns the result. */
+    fun download(pointer: Pointer, directory: File): File? = runCatching {
+        val key = pointer.key ?: error("Missing attachment key")
+        require(pointer.size >= 0 && pointer.size.toLong() <= com.sidephone.aviary.data.MediaStore.MAX_ATTACHMENT_BYTES)
+        val id = pointer.cdnKey?.let { Uri.encode(it) } ?: pointer.cdnId?.toString()
+            ?: error("Missing attachment id")
+        val encrypted = File.createTempFile("signal-download-", ".tmp", directory)
+        val plain = File.createTempFile("signal-plain-", ".tmp", directory)
+        try {
+            val downloadClient = client.newBuilder().readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .callTimeout(30, java.util.concurrent.TimeUnit.MINUTES).build()
+            downloadClient.newCall(Request.Builder().url("${cdnHost(pointer.cdnNumber)}/attachments/$id").build())
+                .execute().use { response ->
+                    check(response.isSuccessful) { "Attachment download HTTP ${response.code}" }
+                    val body = response.body ?: error("Empty attachment response")
+                    body.byteStream().use { input ->
+                        encrypted.outputStream().buffered().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var total = 0L
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                total += count
+                                check(total <= com.sidephone.aviary.data.MediaStore.MAX_ATTACHMENT_BYTES + 1024 * 1024) {
+                                    "Attachment exceeds download limit"
+                                }
+                                output.write(buffer, 0, count)
+                            }
+                        }
+                    }
+                }
+            AttachmentCipher.decrypt(encrypted, plain, key, pointer.digest, pointer.size.toLong())
+            plain
+        } catch (e: Exception) { plain.delete(); throw e }
+        finally { encrypted.delete() }
     }.onFailure { Log.w(TAG, "attachment download failed: ${it.message}") }.getOrNull()
 
     private fun cdnHost(cdnNumber: Int): String = when (cdnNumber) {
@@ -89,80 +89,79 @@ class SignalAttachments(private val client: OkHttpClient) {
     }
 
     /**
-     * Encrypt + upload media, returning a serialized AttachmentPointer proto (or
-     * null on failure). Encryption is AES-256-CBC + HMAC-SHA256 with a random key.
+     * Encrypt + upload media, returning a serialized AttachmentPointer proto. Encryption is AES-256-CBC + HMAC-SHA256 with a random key.
      */
     fun upload(
         authToken: String,
-        media: ByteArray,
+        media: File,
         contentType: String?,
         fileName: String?,
         chatBaseUrl: String = "https://chat.signal.org",
-    ): ByteArray? = runCatching {
+    ): ByteArray = runCatching {
         val aesKey = randomBytes(32)
         val macKey = randomBytes(32)
         val iv = randomBytes(16)
-        val ct = Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
-            init(Cipher.ENCRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
-        }.doFinal(media)
-        val body = iv + ct
-        val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(macKey, "HmacSHA256")) }
-            .doFinal(body)
-        val file = body + mac
-        val digest = MessageDigest.getInstance("SHA-256").digest(file)
+        require(media.isFile && media.length() <= Int.MAX_VALUE) { "Invalid attachment file" }
+        val file = File.createTempFile("signal-upload-", ".tmp", media.parentFile)
+        try {
+            val digest = AttachmentCipher.encrypt(media, file, aesKey, macKey, iv)
 
-        // 1. Obtain an upload form.
-        val formReq = Request.Builder()
-            .url("$chatBaseUrl/v4/attachments/form/upload")
-            .header("Authorization", "Basic $authToken").get().build()
-        val form = client.newCall(formReq).execute().use { resp ->
-            if (!resp.isSuccessful) { Log.w(TAG, "upload form HTTP ${resp.code}"); return null }
-            JSONObject(resp.body?.string() ?: return null)
-        }
-        val cdn = form.getInt("cdn")
-        val cdnKey = form.getString("key")
-        val signedUploadLocation = form.getString("signedUploadLocation")
-        val headers = form.getJSONObject("headers")
+            // 1. Obtain an upload form.
+            val formReq = Request.Builder()
+                .url("$chatBaseUrl/v4/attachments/form/upload")
+                .header("Authorization", "Basic $authToken").get().build()
+            val form = client.newCall(formReq).execute().use { resp ->
+                check(resp.isSuccessful) { "Attachment upload form HTTP ${resp.code}" }
+                JSONObject(resp.body?.string() ?: error("Empty upload form"))
+            }
+            val cdn = form.getInt("cdn")
+            val cdnKey = form.getString("key")
+            val signedUploadLocation = form.getString("signedUploadLocation")
+            val headers = form.getJSONObject("headers")
 
-        // 2. Upload the encrypted bytes.
-        if (!uploadBytes(cdn, signedUploadLocation, headers, file)) return null
+            // 2. Upload the encrypted bytes.
+            uploadBytes(cdn, signedUploadLocation, headers, file)
 
-        // 3. Build the AttachmentPointer.
-        MiniProto.Writer()
-            .string(15, cdnKey)                 // cdnKey
-            .string(2, contentType ?: "application/octet-stream")
-            .bytes(3, aesKey + macKey)          // key
-            .varint(4, media.size.toLong())     // size
-            .bytes(6, digest)                   // digest
-            .varint(14, cdn.toLong())           // cdnNumber
-            .also { if (!fileName.isNullOrBlank()) it.string(7, fileName) }
-            .toByteArray()
-    }.onFailure { Log.w(TAG, "attachment upload failed: ${it.message}") }.getOrNull()
+            // 3. Build the AttachmentPointer.
+            MiniProto.Writer()
+                .string(15, cdnKey)                 // cdnKey
+                .string(2, contentType ?: "application/octet-stream")
+                .bytes(3, aesKey + macKey)          // key
+                .varint(4, media.length())     // size
+                .bytes(6, digest)                   // digest
+                .varint(14, cdn.toLong())           // cdnNumber
+                .also { if (!fileName.isNullOrBlank()) it.string(7, fileName) }
+                .toByteArray()
+        } finally { file.delete() }
+    }.getOrThrow()
 
     private fun uploadBytes(
-        cdn: Int, signedUploadLocation: String, headers: JSONObject, file: ByteArray,
-    ): Boolean {
+        cdn: Int, signedUploadLocation: String, headers: JSONObject, file: File,
+    ) {
         val octet = "application/offset+octet-stream".toMediaType()
-        return if (cdn == 2) {
+        if (cdn == 2) {
             // POST to get the resumable URL, then PUT the bytes.
             val post = Request.Builder().url(signedUploadLocation)
                 .post(ByteArray(0).toRequestBody())
                 .applyHeaders(headers).header("Content-Type", "application/octet-stream").build()
-            val location = client.newCall(post).execute().use { it.header("location") } ?: return false
+            val location = client.newCall(post).execute().use {
+                check(it.isSuccessful) { "Attachment upload session HTTP ${it.code}" }
+                it.header("location") ?: error("Missing attachment upload location")
+            }
             val put = Request.Builder().url(location)
-                .put(file.toRequestBody("application/octet-stream".toMediaType()))
-                .header("Content-Range", "bytes 0-${file.size - 1}/${file.size}").build()
-            client.newCall(put).execute().use { it.isSuccessful }
+                .put(file.asRequestBody("application/octet-stream".toMediaType()))
+                .header("Content-Range", "bytes 0-${file.length() - 1}/${file.length()}").build()
+            client.newCall(put).execute().use { check(it.isSuccessful) { "Attachment upload HTTP ${it.code}" } }
         } else {
             // CDN3: TUS creation-with-upload (single POST).
             val post = Request.Builder().url(signedUploadLocation)
-                .post(file.toRequestBody(octet))
+                .post(file.asRequestBody(octet))
                 .applyHeaders(headers)
                 .header("Tus-Resumable", "1.0.0")
-                .header("Upload-Length", file.size.toString())
+                .header("Upload-Length", file.length().toString())
                 .header("Content-Type", "application/offset+octet-stream")
                 .build()
-            client.newCall(post).execute().use { it.isSuccessful }
+            client.newCall(post).execute().use { check(it.isSuccessful) { "Attachment upload HTTP ${it.code}" } }
         }
     }
 

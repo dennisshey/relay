@@ -60,6 +60,8 @@ Rebuilding that library is its own exercise. The JNI glue is here in `app/src/ma
 
 Releases are signed with a checked-in Android debug key (the standard `android` password), so every build (mine, yours, CI's) shares one signature and can update over the last.
 
+For USB installation from Windows, use `./scripts/install-release.ps1 -Serial <adb-device-serial>` after building. This updates the app while preserving its data, checks that the installed build is non-debuggable, explicitly compiles it for speed, and restarts it. On the SP-01, a plain `adb install -r` can leave a release in verify-only mode with noticeable scrolling lag until Android optimizes it. Wait for compilation to finish before judging performance.
+
 ## Credit
 
 The real work on the iMessage protocol is [OpenBubbles / rustpush](https://github.com/OpenBubbles/rustpush) and the pypush project it grew out of. Relay is the Android app and the on-device wiring around them.

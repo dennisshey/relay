@@ -42,6 +42,20 @@ class AviaryProtocolStore(
         )
     }
 
+    private val pendingGroups = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    internal val challenge = SignalChallenge(prefs.getString("verification.challenge", null)) { token ->
+        check(prefs.edit().apply {
+            if (token == null) remove("verification.challenge") else putString("verification.challenge", token)
+        }.commit()) { "Couldn't save Signal verification state" }
+    }
+
+    internal fun requireVerification(body: String): Nothing {
+        val token = runCatching { org.json.JSONObject(body).getString("token") }.getOrDefault("")
+        // Even an unsupported/malformed challenge must stop automatic sending.
+        challenge.requireVerification(token)
+        throw SignalVerificationRequired()
+    }
+
     init {
         // Re-seed memory from disk without re-persisting (call super, not our overrides).
         for ((key, value) in prefs.all) {
@@ -51,6 +65,10 @@ class AviaryProtocolStore(
             runCatching {
                 val bytes = Base64.decode(value as String, Base64.NO_WRAP)
                 when {
+                    key.startsWith("group-send.") -> {
+                        if (GroupDelivery.decode(bytes).pending.isNotEmpty())
+                            pendingGroups[key] = key.split('.')[1].toLong()
+                    }
                     key.startsWith(PRE) ->
                         super.storePreKey(key.idAfter(PRE), PreKeyRecord(bytes))
                     key.startsWith(SIGNED) ->
@@ -124,8 +142,54 @@ class AviaryProtocolStore(
         prefs.edit().putString(key, Base64.encodeToString(bytes, Base64.NO_WRAP)).apply()
     }
 
+    // Serialize group attempts, including retries, across all sender instances.
+    private val groupSendLocks = Array(64) { Any() }
+    internal fun groupSendLock(key: String): Any = groupSendLocks[(key.hashCode() and Int.MAX_VALUE) % groupSendLocks.size]
+
+    internal fun groupDelivery(key: String): GroupDelivery? = prefs.getString(key, null)?.let {
+        GroupDelivery.decode(Base64.decode(it, Base64.NO_WRAP))
+    }
+
+    internal fun saveGroupDelivery(key: String, delivery: GroupDelivery) {
+        // Publish pending before persistence so an early receipt cannot hide a partial failure.
+        if (delivery.pending.isNotEmpty()) pendingGroups[key] = key.split('.')[1].toLong()
+        check(prefs.edit().putString(key, Base64.encodeToString(delivery.encode(), Base64.NO_WRAP)).commit()) {
+            "Couldn't persist group delivery progress"
+        }
+        if (delivery.pending.isEmpty()) pendingGroups.remove(key)
+    }
+
+    internal fun hasPendingGroup(timestamp: Long): Boolean = pendingGroups.containsValue(timestamp)
+
+    // Include the primary device as well as linked devices, including sessions restored at startup.
+    @Synchronized
+    internal fun sendingDevices(aci: String): List<Int> = prefs.all.keys
+        .filter { it.startsWith("$SESSION$aci.") }
+        .mapNotNull { it.substringAfterLast('.').toIntOrNull() }
+        .filter { loadSession(SignalProtocolAddress(aci, it)).hasSenderChain() }
+
+    internal fun checkSendCooldown(aci: String, endpoint: String) {
+        val until = prefs.getLong("cooldown.$endpoint.$aci", 0)
+        if (until > System.currentTimeMillis())
+            throw com.sidephone.aviary.transport.SendDeferredException(until)
+    }
+
+    internal fun deferSend(aci: String, endpoint: String, retryAfter: String?): Nothing {
+        val now = System.currentTimeMillis()
+        val until = retryAfter?.toLongOrNull()?.takeIf { it in 0..31536000 }
+            ?.let { now + it * 1000 }
+            ?: runCatching { java.time.ZonedDateTime.parse(retryAfter, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() }.getOrNull()
+            ?: (now + 300_000)
+        val deadline = maxOf(now + 1_000, until)
+        check(prefs.edit().putLong("cooldown.$endpoint.$aci", deadline).commit())
+        throw com.sidephone.aviary.transport.SendDeferredException(deadline)
+    }
+
     /** Wipe all persisted key/session state (used when re-linking). */
-    fun clear() = prefs.edit().clear().apply()
+    fun clear() {
+        challenge.state.value?.let { challenge.accepted(it) }
+        pendingGroups.clear(); prefs.edit().clear().apply()
+    }
 
     private fun String.idAfter(prefix: String) = removePrefix(prefix).toInt()
 

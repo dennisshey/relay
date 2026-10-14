@@ -42,6 +42,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             AviaryTheme {
                 AviaryNav(app, intentConversationId(intent), intentSendToAddress(intent))
+                com.sidephone.aviary.ui.SignalVerification(app)
             }
         }
     }

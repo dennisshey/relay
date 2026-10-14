@@ -30,6 +30,7 @@ interface MessageTransport {
     val id: String
     val protocol: Protocol
     val status: StateFlow<TransportStatus>
+    val sendingPaused: Boolean get() = false
 
     /** Called on app start and after setup state changes; must be idempotent. */
     suspend fun start()
@@ -49,6 +50,23 @@ interface MessageTransport {
         fileName: String?,
         caption: String,
     ): Result<Unit> = Result.failure(UnsupportedOperationException("$id doesn't support attachments yet"))
+
+    /** File-based path for large attachments. Legacy transports have a bounded fallback. */
+    suspend fun sendMediaFile(
+        conversation: ConversationEntity, file: java.io.File, contentType: String?,
+        fileName: String?, caption: String,
+    ): Result<Unit> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+            require(file.length() <= 8L * 1024 * 1024) { "$id supports attachments up to 8 MB" }
+            val bytes = file.inputStream().use { input ->
+                val data = com.sidephone.aviary.data.AttachmentStreams.prefix(input, 8 * 1024 * 1024 + 1)
+                require(data.size <= 8 * 1024 * 1024) { "$id supports attachments up to 8 MB" }
+                data
+            }
+            sendMedia(conversation, bytes, contentType, fileName, caption)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
+    }
 
     /**
      * Re-attempt an already-recorded outgoing [message] that previously failed (used by the

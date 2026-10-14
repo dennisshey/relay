@@ -37,24 +37,29 @@ class Outbox(
     private val attempts = ConcurrentHashMap<Long, Int>()
 
     fun start() {
-        // Retry as soon as any internet-capable network becomes available.
-        runCatching {
-            context.getSystemService(ConnectivityManager::class.java)?.registerNetworkCallback(
-                NetworkRequest.Builder()
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build(),
-                object : ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: Network) {
-                        attempts.clear() // fresh connectivity — everything is worth another try
-                        flush()
-                    }
-                },
-            )
-        }.onFailure { Log.w(TAG, "network callback registration failed", it) }
-
-        // Startup pass + slow periodic fallback (covers failures that happened while the
-        // callback wasn't registered, and transports that momentarily weren't ready).
+        val startedAt = System.currentTimeMillis()
         scope.launch {
+            // A process death leaves in-flight rows PENDING. Their persisted recipient progress
+            // lets Signal safely resume only the missing copies after restart.
+            runCatching { repo.recoverInterruptedSends(startedAt) }
+                .onFailure { Log.w(TAG, "outbox recovery failed", it) }
+            // Retry as soon as any internet-capable network becomes available.
+            runCatching {
+                context.getSystemService(ConnectivityManager::class.java)?.registerNetworkCallback(
+                    NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .build(),
+                    object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: Network) {
+                            attempts.clear() // fresh connectivity — everything is worth another try
+                            flush()
+                        }
+                    },
+                )
+            }.onFailure { Log.w(TAG, "network callback registration failed", it) }
+
+            // Startup pass + slow periodic fallback (covers failures that happened while the
+            // callback wasn't registered, and transports that momentarily weren't ready).
             while (isActive) {
                 flushOnce()
                 delay(PERIODIC_MS)
@@ -63,6 +68,12 @@ class Outbox(
     }
 
     fun flush() { scope.launch { flushOnce() } }
+    fun resumeAfterVerification(transportId: String) {
+        scope.launch {
+            repo.failedOutgoing().filter { it.transportId == transportId }.forEach { attempts.remove(it.id) }
+            flushOnce()
+        }
+    }
 
     private suspend fun flushOnce() = flushMutex.withLock {
         val failed = runCatching { repo.failedOutgoing() }.getOrElse { return@withLock }
@@ -73,9 +84,13 @@ class Outbox(
             if ((attempts[msg.id] ?: 0) >= MAX_AUTO_ATTEMPTS) continue
             val convo = repo.getConversation(msg.conversationId) ?: continue
             val transport = transports.byId(msg.transportId) ?: continue
+            if (transport.sendingPaused) continue
             val result = runCatching { transport.resend(convo, msg) }.getOrElse { Result.failure(it) }
             if (result.isSuccess) {
                 attempts.remove(msg.id)
+            } else if (result.exceptionOrNull() is SendDeferredException ||
+                result.exceptionOrNull() is com.sidephone.aviary.transport.signal.SignalVerificationRequired) {
+                blocked.add(msg.conversationId)
             } else {
                 attempts[msg.id] = (attempts[msg.id] ?: 0) + 1
                 blocked.add(msg.conversationId) // preserve order: don't send later ones ahead of this
