@@ -693,22 +693,75 @@ private fun shareImage(context: android.content.Context, path: String) {
     }
 }
 
-/** Save an image into the device Photos (Pictures/Messenger) via MediaStore — no permission on API 30+. */
-private fun saveImageToGallery(context: android.content.Context, path: String) {
-    runCatching {
-        val values = android.content.ContentValues().apply {
-            put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "Messenger_${path.hashCode()}.jpg")
-            put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Messenger")
+/** Image MIME type from a local file's magic bytes, so a PNG/GIF/WEBP isn't saved as a .jpg. */
+private fun imageMimeOf(path: String): String = runCatching {
+    java.io.File(path).inputStream().use { s ->
+        val b = ByteArray(12)
+        val n = s.read(b)
+        val u = { i: Int -> b[i].toInt() and 0xFF }
+        when {
+            n >= 4 && u(0) == 0x89 && u(1) == 0x50 && u(2) == 0x4E && u(3) == 0x47 -> "image/png"
+            n >= 3 && u(0) == 0x47 && u(1) == 0x49 && u(2) == 0x46 -> "image/gif"
+            n >= 12 && u(8) == 0x57 && u(9) == 0x45 && u(10) == 0x42 && u(11) == 0x50 -> "image/webp"
+            n >= 12 && u(4) == 0x66 && u(5) == 0x74 && u(6) == 0x79 && u(7) == 0x70 -> "image/heic"
+            else -> "image/jpeg"
         }
-        val resolver = context.contentResolver
-        val uri = resolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            ?: return
-        resolver.openOutputStream(uri)?.use { out -> java.io.File(path).inputStream().use { it.copyTo(out) } }
-        android.widget.Toast.makeText(context, "Saved to Photos", android.widget.Toast.LENGTH_SHORT).show()
-    }.onFailure {
-        android.widget.Toast.makeText(context, "Couldn't save", android.widget.Toast.LENGTH_SHORT).show()
     }
+}.getOrDefault("image/jpeg")
+
+private val galleryHttp by lazy { okhttp3.OkHttpClient() }
+
+/**
+ * Save a photo or video into the device gallery (Pictures/Messenger or Movies/Messenger) via
+ * MediaStore — no permission on API 30+. [source] is a local file path or, for an Instagram
+ * reel that we only stream, its remote URL (downloaded straight into the gallery entry).
+ */
+private suspend fun saveToGallery(context: android.content.Context, source: String, video: Boolean) {
+    val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        runCatching {
+            val remote = source.startsWith("http")
+            val mime = if (video) "video/mp4" else imageMimeOf(source)
+            val ext = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "jpg"
+            val collection = if (video) android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            else android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "Messenger_${source.hashCode().toUInt()}.$ext")
+                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(
+                    android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+                    if (video) "Movies/Messenger" else "Pictures/Messenger",
+                )
+                put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(collection, values) ?: error("MediaStore insert failed")
+            try {
+                resolver.openOutputStream(uri)!!.use { out ->
+                    if (remote) {
+                        galleryHttp.newCall(okhttp3.Request.Builder().url(source).build()).execute().use { resp ->
+                            check(resp.isSuccessful) { "HTTP ${resp.code}" }
+                            resp.body!!.byteStream().copyTo(out)
+                        }
+                    } else {
+                        java.io.File(source).inputStream().use { it.copyTo(out) }
+                    }
+                }
+                resolver.update(
+                    uri,
+                    android.content.ContentValues().apply { put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0) },
+                    null, null,
+                )
+            } catch (e: Exception) {
+                resolver.delete(uri, null, null) // don't leave a broken, half-written gallery entry
+                throw e
+            }
+        }.isSuccess
+    }
+    android.widget.Toast.makeText(
+        context,
+        if (ok) "Saved to Photos" else "Couldn't save",
+        android.widget.Toast.LENGTH_SHORT,
+    ).show()
 }
 
 /** Open a downloaded attachment (PDF, doc, etc.) in an external viewer via a FileProvider uri. */
@@ -880,6 +933,8 @@ private fun MessageBubble(
 ) {
     val clipboard = LocalClipboardManager.current
     var menuOpen by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
     Column(
         Modifier.fillMaxWidth().padding(top = topSpacing),
         horizontalAlignment = if (msg.outgoing) Alignment.End else Alignment.Start
@@ -991,6 +1046,7 @@ private fun MessageBubble(
                     videoSource = videoSource,
                     shape = bubbleShape,
                     modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp),
+                    onLongClick = { menuOpen = true },
                 )
             } else {
                 Box(
@@ -1014,6 +1070,7 @@ private fun MessageBubble(
                                 videoSource = videoSource,
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp),
+                                onLongClick = { menuOpen = true },
                             )
                             isAudio && msg.mediaPath != null -> VoiceMessage(
                                 path = msg.mediaPath!!,
@@ -1090,6 +1147,14 @@ private fun MessageBubble(
                     DropdownMenuItem(
                         text = { Text("Copy") },
                         onClick = { menuOpen = false; clipboard.setText(AnnotatedString(msg.body)) },
+                    )
+                }
+                // Save the photo, or the video itself (an IG reel downloads from its stream URL).
+                val saveSource = if (isVideo) videoSource else if (isImage) msg.mediaPath else null
+                if (saveSource != null) {
+                    DropdownMenuItem(
+                        text = { Text("Save") },
+                        onClick = { menuOpen = false; scope.launch { saveToGallery(context, saveSource, isVideo) } },
                     )
                 }
                 if (msg.outgoing && msg.status == MessageStatus.FAILED) {
@@ -1469,22 +1534,26 @@ private fun Composer(
  * A media thumbnail. For an Instagram reel/video it overlays a ▶ badge and, on tap, streams the
  * clip straight from its source URL in a fullscreen player — no video download.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MediaThumb(
     imagePath: String?,
     videoSource: String?,
     shape: androidx.compose.ui.graphics.Shape,
     modifier: Modifier = Modifier,
+    onLongClick: (() -> Unit)? = null,
 ) {
     var playing by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     Box(
         modifier = modifier
             .clip(shape)
             .then(
                 when {
-                    videoSource != null -> Modifier.clickable { playing = true }
-                    imagePath != null -> Modifier.clickable { viewing = true } // tap image → viewer
+                    videoSource != null -> Modifier.combinedClickable(onLongClick = onLongClick) { playing = true }
+                    // tap image → viewer
+                    imagePath != null -> Modifier.combinedClickable(onLongClick = onLongClick) { viewing = true }
                     else -> Modifier
                 }
             ),
@@ -1540,8 +1609,13 @@ private fun MediaThumb(
                     },
                     modifier = Modifier.fillMaxSize(),
                 )
-                IconButton(onClick = { playing = false }, modifier = Modifier.align(Alignment.TopEnd)) {
-                    Icon(Icons.Filled.Close, contentDescription = "Close", tint = Color.White)
+                Row(Modifier.align(Alignment.TopEnd).padding(4.dp)) {
+                    IconButton(onClick = { scope.launch { saveToGallery(ctx, videoSource, video = true) } }) {
+                        Icon(Icons.Filled.Download, contentDescription = "Save", tint = Color.White)
+                    }
+                    IconButton(onClick = { playing = false }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close", tint = Color.White)
+                    }
                 }
             }
         }
@@ -1555,6 +1629,7 @@ private fun MediaThumb(
 @Composable
 private fun FullScreenImage(path: String, onDismiss: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         var scale by remember { mutableStateOf(1f) }
         var offset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
@@ -1588,7 +1663,7 @@ private fun FullScreenImage(path: String, onDismiss: () -> Unit) {
                 IconButton(onClick = { shareImage(context, path) }) {
                     Icon(Icons.Filled.Share, contentDescription = "Share", tint = Color.White)
                 }
-                IconButton(onClick = { saveImageToGallery(context, path) }) {
+                IconButton(onClick = { scope.launch { saveToGallery(context, path, video = false) } }) {
                     Icon(Icons.Filled.Download, contentDescription = "Save", tint = Color.White)
                 }
                 IconButton(onClick = onDismiss) {
