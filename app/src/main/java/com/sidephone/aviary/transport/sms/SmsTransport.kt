@@ -403,7 +403,12 @@ class SmsTransport(
                     mediaPath = localPath, mediaType = mime,
                 )
             )
-            dispatchMms(conversation, rowId, media, mime, fileName ?: "image", caption)
+            try {
+                dispatchMms(conversation, rowId, media, mime, fileName ?: "image", caption)
+            } catch (e: Exception) {
+                repo.setMessageStatus(rowId, MessageStatus.FAILED)
+                throw e
+            }
         }
     }
 
@@ -429,7 +434,66 @@ class SmsTransport(
     private fun dispatchMms(
         conversation: ConversationEntity, rowId: Long, media: ByteArray,
         mime: String, fileName: String, caption: String,
-    ) = dispatchMms(conversation, rowId, caption.ifBlank { null }, listOf(MmsCompose.Image(mime, media, fileName)))
+    ) {
+        val text = caption.ifBlank { null }
+        val budget = mmsMaxBytes() - (text?.toByteArray()?.size ?: 0) - MMS_OVERHEAD_BYTES
+        val (data, type) = fitForMms(media, mime, budget)
+        val name = if (type != mime) fileName.substringBeforeLast('.') + ".jpg" else fileName
+        dispatchMms(conversation, rowId, text, listOf(MmsCompose.Image(type, data, name)))
+    }
+
+    /** The carrier's MMS size cap. Android's MMS service rejects a larger PDU on the spot, without
+     *  ever contacting the carrier, which is why full-size photos failed instantly. */
+    private fun mmsMaxBytes(): Int {
+        val fromCarrier = runCatching {
+            context.getSystemService(android.telephony.CarrierConfigManager::class.java)
+                ?.config?.getInt(android.telephony.CarrierConfigManager.KEY_MMS_MAX_MESSAGE_SIZE_INT)
+        }.getOrNull()
+        return fromCarrier?.takeIf { it > 0 } ?: DEFAULT_MMS_MAX_BYTES
+    }
+
+    /**
+     * Shrink an image until it fits in [budget] bytes: downscale (EXIF rotation applied by
+     * ImageDecoder) and re-encode as JPEG at falling quality. Anything already small enough goes
+     * as-is. Non-images can't be shrunk here, so an oversized one fails with a clear reason.
+     */
+    private fun fitForMms(bytes: ByteArray, mime: String, budget: Int): Pair<ByteArray, String> {
+        if (bytes.size <= budget) return bytes to mime
+        require(mime.startsWith("image/")) {
+            "Too large for MMS (${bytes.size / 1024} KB, limit ${budget / 1024} KB)"
+        }
+        val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
+        var bitmap = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+            val longest = maxOf(info.size.width, info.size.height)
+            if (longest > MMS_MAX_EDGE) {
+                val scale = MMS_MAX_EDGE.toFloat() / longest
+                decoder.setTargetSize(
+                    (info.size.width * scale).toInt().coerceAtLeast(1),
+                    (info.size.height * scale).toInt().coerceAtLeast(1),
+                )
+            }
+        }
+        try {
+            while (true) {
+                for (quality in intArrayOf(85, 70, 55, 40)) {
+                    val out = java.io.ByteArrayOutputStream()
+                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+                    if (out.size() <= budget) return out.toByteArray() to "image/jpeg"
+                }
+                require(maxOf(bitmap.width, bitmap.height) > 160) { "Couldn't shrink the image enough for MMS" }
+                val smaller = android.graphics.Bitmap.createScaledBitmap(
+                    bitmap, (bitmap.width * 0.7f).toInt(), (bitmap.height * 0.7f).toInt(), true,
+                )
+                bitmap.recycle()
+                bitmap = smaller
+            }
+            @Suppress("UNREACHABLE_CODE")
+            error("unreachable")
+        } finally {
+            bitmap.recycle()
+        }
+    }
 
     /** Build an MMS PDU (text and/or images) and hand it to the platform, wiring the result back to
      *  [rowId]. Recipients come from the conversation address (comma/semicolon-separated for groups),
@@ -677,5 +741,11 @@ class SmsTransport(
 
     companion object {
         const val ID = "sms"
+        /** Android's own fallback when the carrier config doesn't say. */
+        private const val DEFAULT_MMS_MAX_BYTES = 300 * 1024
+        /** Room left for PDU headers and part headers. */
+        private const val MMS_OVERHEAD_BYTES = 6 * 1024
+        /** Longest edge of an MMS photo; larger only costs bytes the carrier will squash anyway. */
+        private const val MMS_MAX_EDGE = 1600
     }
 }

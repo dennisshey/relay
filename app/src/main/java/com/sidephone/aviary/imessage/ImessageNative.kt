@@ -48,6 +48,13 @@ object ImessageNative {
         participantsJson: String, path: String, mime: String, filename: String, caption: String, guid: String,
     ): String
 
+    /** Set the Name and Photo keys attached when a send asks for `"share_profile":true`
+     *  (native JSON form `{record,key,poster}`); "" clears them. */
+    external fun nativeSetProfile(profileJson: String): String
+
+    /** Ask our own other devices (the iPhone) to re-send the Name and Photo keys. */
+    external fun nativeRequestProfile(): String
+
     /** Diagnostic: JSON {ok, handles:[...]} — the registered iMessage handles. */
     external fun nativeHandles(): String
 

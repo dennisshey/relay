@@ -634,13 +634,26 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
 
 /** A voice-note bubble: play/pause an audio attachment from its local file. */
 @Composable
-private fun VoiceMessage(path: String, tint: Color) {
+private fun VoiceMessage(path: String, mime: String?, tint: Color) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var playing by remember(path) { mutableStateOf(false) }
-    val player = remember(path) { android.media.MediaPlayer() }
-    androidx.compose.runtime.DisposableEffect(path) {
-        runCatching { player.setDataSource(path); player.prepare() }
-        player.setOnCompletionListener { playing = false; runCatching { player.seekTo(0) } }
-        onDispose { runCatching { player.release() } }
+    var failed by remember(path) { mutableStateOf(false) }
+    // iMessage voice notes are Apple CAF, which MediaPlayer can't open: rewrap them (off the main
+    // thread, cached) into Ogg/ADTS/WAV first. null player = still preparing, or [failed].
+    val player by androidx.compose.runtime.produceState<android.media.MediaPlayer?>(null, path) {
+        val ready = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val playable = com.sidephone.aviary.data.CafAudio.playablePath(path, context.cacheDir)
+                ?: return@withContext null
+            runCatching {
+                android.media.MediaPlayer().apply {
+                    try { setDataSource(playable); prepare() } catch (e: Exception) { release(); throw e }
+                }
+            }.onFailure { android.util.Log.w("VoiceMessage", "can't play $playable", it) }.getOrNull()
+        }
+        value = ready
+        if (ready == null) failed = true
+        ready?.setOnCompletionListener { playing = false; runCatching { it.seekTo(0) } }
+        awaitDispose { runCatching { ready?.release() } }
     }
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -651,8 +664,14 @@ private fun VoiceMessage(path: String, tint: Color) {
             contentDescription = if (playing) "Pause" else "Play",
             tint = tint,
             modifier = Modifier.size(28.dp).clickable {
-                if (playing) { runCatching { player.pause() }; playing = false }
-                else runCatching { player.start(); playing = true }
+                val p = player
+                when {
+                    // Couldn't play in-app: hand the file to another app rather than doing nothing.
+                    p == null && failed -> openAttachment(context, path, mime ?: "audio/*")
+                    p == null -> Unit
+                    playing -> { runCatching { p.pause() }; playing = false }
+                    else -> runCatching { p.start(); playing = true }
+                }
             },
         )
         Spacer(Modifier.size(6.dp))
@@ -1008,7 +1027,12 @@ private fun MessageBubble(
             }
         }
         val isVideo = msg.mediaType?.startsWith("video/") == true
-        val isAudio = msg.mediaType?.startsWith("audio/") == true
+        // Older iMessage voice notes were stored with a generic type; recognize the CAF file itself.
+        val isAudio = remember(msg.mediaPath, msg.mediaType) {
+            msg.mediaType?.startsWith("audio/") == true ||
+                (msg.mediaPath != null && !isVideo && msg.mediaType?.startsWith("image/") != true &&
+                    com.sidephone.aviary.data.CafAudio.isCaf(java.io.File(msg.mediaPath!!)))
+        }
         // A video plays from a remote URL (IG reel) OR a downloaded local file (Signal/iMessage).
         val videoSource = when {
             !msg.mediaUrl.isNullOrBlank() -> msg.mediaUrl
@@ -1074,6 +1098,7 @@ private fun MessageBubble(
                             )
                             isAudio && msg.mediaPath != null -> VoiceMessage(
                                 path = msg.mediaPath!!,
+                                mime = msg.mediaType,
                                 tint = if (msg.outgoing) Color.White
                                 else MaterialTheme.colorScheme.onSecondaryContainer,
                             )

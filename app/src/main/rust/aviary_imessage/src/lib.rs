@@ -29,6 +29,7 @@ use rustpush::{
     Attachment, EditMessage, IMClient, IndexedMessagePart, LoginDelegate, Message, MessageInst,
     MessagePart, MessageParts, MessageType, MMCSFile, NormalMessage, OSConfig, ReactMessage,
     Reaction, ReactMessageType, TokenProvider, UnsendMessage, MADRID_SERVICE,
+    ShareProfileMessage, SharedPoster,
 };
 use rustpush::statuskit::{
     ChannelInterestToken, StatusKitClient, StatusKitMessage, StatusKitState,
@@ -71,6 +72,10 @@ struct AviaryImessage {
     sk_want: std::collections::HashSet<String>, // handles we want focus status for (people we message)
     sk_token: Option<ChannelInterestToken>,     // holds the focus-channel subscriptions alive
     sk_dirty: bool,                             // re-subscribe only when the want-set changed
+    // The account's iMessage "Name and Photo" keys (CloudKit record id + decryption key), learned
+    // from the iPhone. Attached to an outgoing message when Kotlin asks, which is how a recipient
+    // gets our name and photo. Kotlin owns persistence and hands it back via nativeSetProfile.
+    my_profile: Option<ShareProfileMessage>,
 }
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -263,6 +268,7 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeI
             sk_want: std::collections::HashSet::new(),
             sk_token: None,
             sk_dirty: false,
+            my_profile: None,
         });
 
         ok(serde_json::json!({ "registered": registered }))
@@ -709,6 +715,7 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeS
             Err(e) => return err(e),
         };
         let want_handles = participants.clone();
+        let embed = if wants_profile(&participants_json) { s.my_profile.clone() } else { None };
         // Scope the client borrow so we can update sk_want (focus-status subscriptions) after.
         let send_result = {
             let client = match s.client.as_ref() {
@@ -722,6 +729,7 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeS
             };
 
             let mut normal = NormalMessage::new(text, MessageType::IMessage);
+            normal.embedded_profile = embed;
             // Inline reply: point at the quoted message's guid (part 0 = its text body).
             if !reply_guid.is_empty() {
                 normal.reply_guid = Some(reply_guid);
@@ -840,6 +848,104 @@ impl ParticipantsArg {
         let blank = |v: Option<String>| v.filter(|x| !x.is_empty());
         Ok((handles, blank(cv_name), blank(sender_guid)))
     }
+}
+
+/// True if the participants argument asks to attach our Name and Photo (`"share_profile":true`).
+fn wants_profile(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("share_profile").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+fn b64(b: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+fn unb64(s: Option<&str>) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s?).ok()
+}
+
+/// `{"record":…, "key":b64, "poster":{"lr":b64,"w":b64,"m":b64}|null}` — the wire form Kotlin stores.
+fn profile_to_json(p: &ShareProfileMessage) -> serde_json::Value {
+    serde_json::json!({
+        "record": p.cloud_kit_record_key,
+        "key": b64(&p.cloud_kit_decryption_record_key),
+        "poster": p.poster.as_ref().map(|w| serde_json::json!({
+            "lr": b64(&w.low_res_wallpaper_tag), "w": b64(&w.wallpaper_tag), "m": b64(&w.message_tag),
+        })),
+    })
+}
+
+fn profile_from_json(v: &serde_json::Value) -> Option<ShareProfileMessage> {
+    let record = v.get("record")?.as_str()?.to_string();
+    let key = unb64(v.get("key")?.as_str())?;
+    if record.is_empty() || key.is_empty() { return None; }
+    let poster = v.get("poster").filter(|p| !p.is_null()).and_then(|p| Some(SharedPoster {
+        low_res_wallpaper_tag: unb64(p.get("lr")?.as_str())?,
+        wallpaper_tag: unb64(p.get("w")?.as_str())?,
+        message_tag: unb64(p.get("m")?.as_str())?,
+    }));
+    Some(ShareProfileMessage { cloud_kit_decryption_record_key: key, cloud_kit_record_key: record, poster })
+}
+
+/// Set (or clear, with "" / invalid JSON) the Name and Photo keys attached to outgoing messages.
+#[no_mangle]
+pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeSetProfile(
+    mut env: JNIEnv,
+    _class: JClass,
+    profile_json: JString,
+) -> jstring {
+    let profile_json = jstr(&mut env, &profile_json);
+    let out = with_state(move |cell| async move {
+        let mut guard = cell.lock().await;
+        let s = match guard.as_mut() {
+            Some(s) => s,
+            None => return err("not initialized"),
+        };
+        s.my_profile = serde_json::from_str::<serde_json::Value>(&profile_json)
+            .ok()
+            .and_then(|v| profile_from_json(&v));
+        ok(serde_json::json!({ "set": s.my_profile.is_some() }))
+    });
+    ret(&env, out)
+}
+
+/// Ask our own other devices (the iPhone) to re-send the account's Name and Photo keys. They
+/// answer with an UpdateProfile, which the poll surfaces as a "profile_update".
+#[no_mangle]
+pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeRequestProfile(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let out = with_state(move |cell| async move {
+        let guard = cell.lock().await;
+        let s = match guard.as_ref() {
+            Some(s) => s,
+            None => return err("not initialized"),
+        };
+        let client = match s.client.as_ref() {
+            Some(c) => c,
+            None => return err("not registered"),
+        };
+        let handles = client.identity.get_handles().await;
+        let handle = match handles.first() {
+            Some(h) => h.clone(),
+            None => return err("no handle"),
+        };
+        let mut msg = MessageInst::new(
+            ConversationData { participants: vec![handle.clone()], cv_name: None, sender_guid: None, after_guid: None },
+            &handle,
+            Message::RecoverProfile,
+        );
+        match client.send(&mut msg).await {
+            Ok(_) => ok(serde_json::json!({})),
+            Err(e) => err(format!("send: {e}")),
+        }
+    });
+    ret(&env, out)
 }
 
 /// Build the ConversationData + our handle for an outbound message to `participants_json`.
@@ -1082,6 +1188,9 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeS
         }
         let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
         normal.parts = MessageParts(parts);
+        if wants_profile(&participants_json) {
+            normal.embedded_profile = s.my_profile.clone();
+        }
         let mut msg = MessageInst::new(convo, &handle, Message::Message(normal));
         if !guid.is_empty() {
             msg.id = guid;
@@ -1260,6 +1369,24 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeP
                 let handles = client.identity.get_handles().await;
                 let sender = m.sender.clone().unwrap_or_default();
                 let from_me = handles.iter().any(|h| h == &sender);
+                // Name and Photo keys. Our iPhone syncs them to us (UpdateProfile, ShareProfile
+                // reflected from its sends). Kotlin decides whether the sender is really us —
+                // native only knows our email handles, not our phone number.
+                let share_kind = match &m.message {
+                    Message::UpdateProfile(u) => Some((u.profile.as_ref(), "update")),
+                    Message::ShareProfile(p) => Some((Some(p), "share")),
+                    _ => None,
+                };
+                if let Some((profile, how)) = share_kind {
+                    log::info!("[relay] profile {how} from {sender} present={}", profile.is_some());
+                    return ok(serde_json::json!({
+                        "empty": false, "profile_update": true, "how": how, "sender": sender,
+                        "profile": profile.map(profile_to_json),
+                    }));
+                }
+                let embedded_profile = if let Message::Message(n) = &m.message {
+                    n.embedded_profile.as_ref().map(profile_to_json)
+                } else { None };
                 // Classic iMessage: ack the sender so they see "Delivered" and Apple stops
                 // re-delivering this message. The receipt reuses the original's guid.
                 if !from_me && m.send_delivered {
@@ -1378,7 +1505,12 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeP
                 );
                 let has_content = media_path.is_some()
                     || clean_text.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
-                if !has_content {
+                if !has_content && embedded_profile.is_some() {
+                    ok(serde_json::json!({
+                        "empty": false, "profile_update": true, "how": "embedded", "sender": sender,
+                        "profile": embedded_profile,
+                    }))
+                } else if !has_content {
                     // Non-text (delivery/read receipt, typing, etc.) — no inbox row yet.
                     ok(serde_json::json!({ "empty": true }))
                 } else {
@@ -1397,6 +1529,7 @@ pub extern "system" fn Java_com_sidephone_aviary_imessage_ImessageNative_nativeP
                         "mentioned": mentions_me(&m.message, &handles),
                         "media_path": media_path,
                         "media_mime": media_mime,
+                        "profile": embedded_profile,
                     }))
                 }
             }

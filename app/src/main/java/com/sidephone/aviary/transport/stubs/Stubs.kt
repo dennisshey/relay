@@ -16,6 +16,9 @@ import com.sidephone.aviary.transport.TransportStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -90,6 +93,23 @@ class IMessageTransport(
                 reachable
             }.getOrDefault(false)
         }
+    }
+
+    /** Uncached IDS lookup for [handle]: true/false when Apple answered, null if every attempt
+     *  errored. Updates [reachCache] with a real answer, so a stale "unreachable" (e.g. left by a
+     *  one-off send failure) is corrected. */
+    private suspend fun lookupReach(handle: String, attempts: Int = 3): Boolean? {
+        repeat(attempts) { i ->
+            if (initialized) {
+                val res = runCatching { json(ImessageNative.nativeCanReach(handle)) }.getOrNull()
+                if (res != null && res.optBoolean("ok")) {
+                    return res.optBoolean("reachable").also { reachCache[handle] = it }
+                }
+                Log.w(TAG, "reachability lookup for $handle failed: ${res?.optString("error")}")
+            }
+            if (i < attempts - 1) delay(700L * (i + 1))
+        }
+        return null
     }
 
     override suspend fun start() = withContext(Dispatchers.IO) {
@@ -227,9 +247,11 @@ class IMessageTransport(
                     replyToPreview = replyTo?.let { it.body.ifBlank { null } },
                 )
             )
-            val participants = participantsJson(conversation)
+            val shareTo = profileRecipients(conversation)
+            val participants = participantsJson(conversation, shareProfile = shareTo.isNotEmpty())
             val res = json(ImessageNative.nativeSendText(participants, body, replyGuid ?: "", guid))
             if (res.optBoolean("ok")) {
+                markProfileShared(shareTo)
                 // Only PENDING→SENT: never downgrade a DELIVERED/READ that already raced in.
                 repo.upgradeFromPending(rowId, MessageStatus.SENT)
                 Result.success(Unit)
@@ -317,7 +339,24 @@ class IMessageTransport(
     /** Recipient list for a send. A group thread (externalId is a ";"-joined participant list) sends
      *  to every member except us; a 1:1 sends to the single handle. rustpush keys the group by its
      *  participant set, so addressing all members continues the same iMessage group. */
-    private fun participantsJson(convo: ConversationEntity): String {
+    private fun participantsJson(convo: ConversationEntity, shareProfile: Boolean = false): String {
+        val isGroup = convo.externalId.contains(";")
+        val handles = recipientHandles(convo)
+        val list = JSONArray().apply { handles.forEach { put(it) } }
+        // A named group is matched on its id, not its member list. Send both back, or the message
+        // opens a brand-new unnamed group on everyone else's device instead of joining this one.
+        val groupId = convo.groupId?.takeIf { it.isNotBlank() }?.takeIf { isGroup }
+        val groupName = convo.groupName?.takeIf { it.isNotBlank() }?.takeIf { isGroup }
+        if (groupId == null && groupName == null && !shareProfile) return list.toString()
+        return JSONObject().apply {
+            put("participants", list)
+            if (groupName != null) put("cv_name", groupName)
+            if (groupId != null) put("sender_guid", groupId)
+            if (shareProfile) put("share_profile", true)
+        }.toString()
+    }
+
+    private fun recipientHandles(convo: ConversationEntity): List<String> {
         val isGroup = convo.externalId.contains(";")
         val handles = if (isGroup) {
             convo.externalId.split(";").map { it.trim() }.filter { it.isNotEmpty() }
@@ -325,17 +364,65 @@ class IMessageTransport(
                 .filterNot { isSelfHandle(it) }
                 .ifEmpty { convo.externalId.split(";").filter { it.isNotBlank() }.map { imessageHandle(it.trim()) } }
         } else listOf(imessageHandle(convo.address))
-        val list = JSONArray().apply { handles.distinct().forEach { put(it) } }
-        // A named group is matched on its id, not its member list. Send both back, or the message
-        // opens a brand-new unnamed group on everyone else's device instead of joining this one.
-        val groupId = convo.groupId?.takeIf { it.isNotBlank() }
-        val groupName = convo.groupName?.takeIf { it.isNotBlank() }
-        if (!isGroup || (groupId == null && groupName == null)) return list.toString()
-        return JSONObject().apply {
-            put("participants", list)
-            if (groupName != null) put("cv_name", groupName)
-            if (groupId != null) put("sender_guid", groupId)
-        }.toString()
+        return handles.distinct()
+    }
+
+    // ---- Name and Photo sharing ---------------------------------------------------------------
+    // The iPhone on this Apple ID owns the profile (it lives in iCloud); we only learn its keys —
+    // the iPhone syncs them to its other devices — and attach them to outgoing messages, which is
+    // all "Share Name and Photo" is on the wire. Shared with everyone, once per person per profile
+    // version. We never write the profile, so nothing here can clobber the iPhone's.
+
+    /** The account's profile keys (native JSON form), or null if the iPhone hasn't sent them yet. */
+    private fun storedProfile(): JSONObject? =
+        prefs.getString(KEY_MY_PROFILE, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+    /** Recipients of [convo] who haven't been sent the current profile, or empty if there's none. */
+    private fun profileRecipients(convo: ConversationEntity): List<String> {
+        val record = storedProfile()?.optString("record")?.ifBlank { null } ?: return emptyList()
+        val shared = prefs.getStringSet(KEY_PROFILE_SHARED, emptySet()).orEmpty()
+        return recipientHandles(convo).filter { "$record|${it.lowercase()}" !in shared }
+    }
+
+    private fun markProfileShared(handles: List<String>) {
+        val record = storedProfile()?.optString("record")?.ifBlank { null } ?: return
+        if (handles.isEmpty()) return
+        val shared = prefs.getStringSet(KEY_PROFILE_SHARED, emptySet()).orEmpty()
+            .filter { it.startsWith("$record|") }.toMutableSet() // drop entries for old versions
+        handles.forEach { shared += "$record|${it.lowercase()}" }
+        prefs.edit().putStringSet(KEY_PROFILE_SHARED, shared).apply()
+    }
+
+    /** Accept profile keys only from our own account (the iPhone): anyone else's would make us
+     *  hand out a stranger's name and photo as ours. */
+    private fun onProfileKeys(sender: String, profile: JSONObject?, how: String) {
+        if (!isSelfHandle(sender)) return
+        val current = storedProfile()
+        when {
+            profile == null && how == "update" -> {
+                Log.i(TAG, "iPhone deleted the Name and Photo profile")
+                prefs.edit().remove(KEY_MY_PROFILE).apply()
+            }
+            profile == null -> return
+            current?.optString("record") == profile.optString("record") &&
+                current.optString("key") == profile.optString("key") -> return
+            else -> {
+                Log.i(TAG, "learned Name and Photo keys ($how) record=${profile.optString("record")}")
+                prefs.edit().putString(KEY_MY_PROFILE, profile.toString()).apply()
+            }
+        }
+        runCatching { ImessageNative.nativeSetProfile(prefs.getString(KEY_MY_PROFILE, null) ?: "") }
+    }
+
+    /** Hand the stored profile to native; if we have none, ask the iPhone for it. */
+    private fun loadProfile() {
+        val stored = prefs.getString(KEY_MY_PROFILE, null)
+        if (stored != null) {
+            runCatching { ImessageNative.nativeSetProfile(stored) }
+        } else {
+            val res = runCatching { ImessageNative.nativeRequestProfile() }.getOrNull()
+            Log.i(TAG, "requested Name and Photo keys from own devices: $res")
+        }
     }
 
     /** Canonical key for an iMessage group: each member normalized to a tel:/mailto: handle, our own
@@ -348,13 +435,34 @@ class IMessageTransport(
             .filterNot { isSelfHandle(it) }
             .distinct().sorted().joinToString(";")
 
-    /** Start (or reopen) an iMessage group with [addresses]. Fails unless every member is reachable
-     *  on iMessage, so the caller can fall back to a group MMS. */
+    /** Thrown by [startGroup] when the group can't be iMessage — someone isn't on iMessage, or
+     *  iMessage itself is unavailable — so the caller should make a group MMS instead. Any other
+     *  failure means "couldn't tell", which shouldn't silently turn into MMS. */
+    class NotImessageGroup(message: String) : Exception(message)
+
+    /** Start (or reopen) an iMessage group with [addresses]. Fails with [NotImessageGroup] unless
+     *  every member is reachable on iMessage, so the caller can fall back to a group MMS. */
     suspend fun startGroup(addresses: List<String>): Result<Long> = withContext(Dispatchers.IO) {
         runCatching {
             val handles = addresses.map { imessageHandle(it) }.distinct()
             require(handles.size >= 2) { "a group needs at least two people" }
-            require(handles.all { canReach(it) }) { "not everyone is on iMessage" }
+            // canReach() answers false for "iMessage is still connecting", "the lookup hiccuped" and
+            // a stale cached miss alike — any of which used to drop the whole group to MMS. Wait for
+            // the connection, ask Apple fresh, and retry lookups that error before deciding.
+            if (_status.value is TransportStatus.NeedsSetup || _status.value is TransportStatus.Planned) {
+                throw NotImessageGroup("iMessage isn't set up")
+            }
+            withTimeoutOrNull(15_000) { _status.first { it is TransportStatus.Ready } }
+                ?: throw NotImessageGroup("iMessage isn't connected")
+            for (h in handles) {
+                when (lookupReach(h)) {
+                    true -> Unit
+                    false -> throw NotImessageGroup("${cleanHandle(h)} isn't on iMessage")
+                    // Apple didn't answer: don't guess. Silently making an MMS group out of a group
+                    // of iPhone users is the bug this replaces; let the user retry instead.
+                    null -> error("Couldn't check ${cleanHandle(h)} on iMessage — try again")
+                }
+            }
             val key = canonicalGroupKey(handles.joinToString(";"))
             require(key.contains(";")) { "need at least two other members" }
             repo.upsertConversation(
@@ -524,11 +632,13 @@ class IMessageTransport(
             )
         )
         try {
+            val shareTo = profileRecipients(conversation)
             val res = json(ImessageNative.nativeSendMedia(
-                participantsJson(conversation), localPath, mime,
+                participantsJson(conversation, shareProfile = shareTo.isNotEmpty()), localPath, mime,
                 sendName, caption, guid,
             ))
             if (res.optBoolean("ok")) {
+                markProfileShared(shareTo)
                 repo.upgradeFromPending(rowId, MessageStatus.SENT)
                 Result.success(Unit)
             } else {
@@ -623,6 +733,7 @@ class IMessageTransport(
             // in sync as the address book changes.
             runCatching { refreshContacts() }.onFailure { Log.w(TAG, "refresh contacts failed", it) }
             registerContactsObserver()
+            runCatching { loadProfile() }.onFailure { Log.w(TAG, "load profile failed", it) }
             while (isActive) {
                 try {
                     val res = json(ImessageNative.nativePoll(30_000))
@@ -642,6 +753,14 @@ class IMessageTransport(
     }
 
     private suspend fun handleIncoming(msg: JSONObject) {
+        // Our Name and Photo keys, synced from the iPhone (alone, or riding on its sent message).
+        if (msg.optBoolean("profile_update", false)) {
+            onProfileKeys(msg.optString("sender"), msg.optJSONObject("profile"), msg.optString("how"))
+            return
+        }
+        if (msg.optBoolean("from_me", false)) {
+            msg.optJSONObject("profile")?.let { onProfileKeys(msg.optString("sender"), it, "embedded") }
+        }
         // Message edited or unsent by the other party.
         if (msg.optBoolean("edit", false)) {
             val target = msg.optString("target").ifBlank { return }
@@ -838,7 +957,13 @@ class IMessageTransport(
         val replyPreview = replyTo?.let { repo.bodyForExternal(id, it) }
         // Attachment downloaded by the native poll (MMCS), if any.
         val mediaPath = msg.optStringOrNull("media_path")
-        val mediaMime = msg.optStringOrNull("media_mime")
+        // Voice messages are Apple CAF files; native often reports them with a blank or generic
+        // type, which would render as a plain "Attachment". Tag them as audio so they play.
+        val mediaMime = msg.optStringOrNull("media_mime").let { m ->
+            if (mediaPath != null && m?.startsWith("audio/") != true && m?.startsWith("image/") != true &&
+                m?.startsWith("video/") != true && com.sidephone.aviary.data.CafAudio.isCaf(java.io.File(mediaPath))
+            ) "audio/x-caf" else m
+        }
         val rowId = repo.recordMessage(
             MessageEntity(
                 conversationId = convo.id,
@@ -1176,5 +1301,7 @@ class IMessageTransport(
         private const val KEY_REGISTERED = "imessage_registered"
         private const val KEY_GROUP_AVATARS_FIXED = "group_avatars_fixed"
         private const val KEY_NAC_CHECKED = "nac_checked_v1"
+        private const val KEY_MY_PROFILE = "name_photo_profile"
+        private const val KEY_PROFILE_SHARED = "name_photo_shared"
     }
 }

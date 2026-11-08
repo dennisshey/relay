@@ -138,10 +138,15 @@ fun NewMessageScreen(app: RelayApp, onOpenThread: (Long) -> Unit, onBack: () -> 
                             }
                         },
                         onStartGroup = { numbers ->
-                            // All members on iMessage -> a blue iMessage group; otherwise a group MMS.
+                            // All members on iMessage -> a blue iMessage group. Only a definite "no"
+                            // (someone isn't on iMessage, or iMessage is down) falls back to group
+                            // MMS; a failed lookup surfaces as an error so the user can retry.
                             run {
                                 val imsg = app.imessageTransport.startGroup(numbers)
-                                if (imsg.isSuccess) imsg else app.smsTransport.startGroup(numbers)
+                                val why = imsg.exceptionOrNull()
+                                if (why is com.sidephone.aviary.transport.imessage.IMessageTransport.NotImessageGroup) {
+                                    app.smsTransport.startGroup(numbers)
+                                } else imsg
                             }
                         },
                     )
