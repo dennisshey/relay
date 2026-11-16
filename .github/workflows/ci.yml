@@ -1,0 +1,59 @@
+name: CI
+
+# Debug unit tests on pull requests and on pushes to main.
+#
+# lintDebug is not run. On current main it fails with 7 existing errors: a lint
+# crash analyzing ThreadScreen.kt (Kotlin metadata 2.1.0 vs the 2.0.0 maximum
+# bundled with AGP 8.2.2), MissingPermission in Notifier.kt, and
+# PermissionImpliesUnsupportedChromeOsHardware on five manifest permissions.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Cache Gradle state only. Do not submit a dependency graph.
+          dependency-graph: disabled
+
+      - name: Set up Android SDK
+        # v3 installs the removed `tools` package and fails the build. Same pin
+        # as the release workflow.
+        uses: android-actions/setup-android@v4
+
+      - name: Run unit tests
+        run: |
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          if-no-files-found: ignore
