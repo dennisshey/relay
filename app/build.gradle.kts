@@ -15,8 +15,8 @@ android {
         applicationId = "com.sidephone.aviary"
         minSdk = 30
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.2.4"
+        versionCode = 7
+        versionName = "0.2.5"
 
         // SP-01 is arm64; ship only that ABI to keep the APK small.
         ndk { abiFilters += "arm64-v8a" }
