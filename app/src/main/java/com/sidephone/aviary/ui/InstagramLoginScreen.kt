@@ -31,6 +31,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.sidephone.aviary.RelayApp
+import com.sidephone.aviary.transport.instagram.InstagramLogin
 import com.sidephone.aviary.transport.instagram.InstagramTransport
 import kotlinx.coroutines.launch
 
@@ -78,7 +79,7 @@ fun InstagramLoginScreen(app: RelayApp, onBack: () -> Unit) {
                 is InstagramTransport.SetupState.AwaitingTwoFactor -> {
                     Text("Enter the code", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "Instagram sent a 2FA code to ${s.username}'s trusted method.",
+                        InstagramLogin.twoFactorPrompt(s.method, s.username),
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     OutlinedTextField(

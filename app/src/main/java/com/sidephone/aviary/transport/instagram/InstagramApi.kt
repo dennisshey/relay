@@ -9,6 +9,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -28,13 +29,21 @@ class InstagramApi(
         .build()
 
     private val base = "https://i.instagram.com/api/v1"
+    private val webLogin = "https://www.instagram.com/accounts/login/"
+    private val webAjax = "https://www.instagram.com/api/v1/web/accounts/login/ajax/"
+
+    private var pendingWebLogin = false
+    private var webSprinkleName: String? = null
+    private var webSprinkleVersion = 0
+    private var webSprinkleRandomize = false
+    private var webRollout: String? = null
 
     // ---- results -----------------------------------------------------------
 
     sealed class LoginResult {
         data object Success : LoginResult()
-        data class TwoFactor(val identifier: String, val username: String) : LoginResult()
-        data class Challenge(val apiPath: String) : LoginResult()
+        data class TwoFactor(val identifier: String, val username: String, val method: String) : LoginResult()
+        data class Challenge(val apiPath: String, val message: String) : LoginResult()
         data class Error(val message: String) : LoginResult()
     }
 
@@ -43,6 +52,7 @@ class InstagramApi(
     private fun Request.Builder.commonHeaders(appId: String = InstagramDevice.APP_ID): Request.Builder = apply {
         header("User-Agent", device.userAgent)
         header("X-IG-App-ID", appId)
+        header("X-IG-App-Locale", "en_US")
         header("X-IG-Capabilities", InstagramDevice.CAPABILITIES)
         header("X-IG-Connection-Type", "WIFI")
         header("X-IG-Device-ID", device.deviceId)
@@ -50,9 +60,12 @@ class InstagramApi(
         header("X-IG-Android-ID", device.androidId)
         header("X-IG-Device-Locale", "en_US")
         header("X-IG-Mapped-Locale", "en_US")
+        header("X-Bloks-Version-Id", InstagramDevice.BLOKS_VERSION_ID)
+        header("X-Bloks-Is-Layout-RTL", "false")
         header("Accept-Language", "en-US")
         header("X-IG-WWW-Claim", account.wwwClaim ?: "0")
-        header("X-FB-HTTP-Engine", "Liger")
+        header("IG-INTENDED-USER-ID", account.userId ?: "0")
+        header("X-FB-HTTP-Engine", "Tigon/MNS/TCP")
         account.mid?.let { header("X-MID", it) }
         account.authorization?.let { header("Authorization", it) }
         account.csrfToken?.let { header("Cookie", "csrftoken=$it; sessionid=${account.sessionId ?: ""}") }
@@ -80,28 +93,92 @@ class InstagramApi(
 
     // ---- login -------------------------------------------------------------
 
-    /** Pre-login sync: fetches the password-encryption public key + seeds mid/csrf cookies. */
-    private data class PubKey(val id: Int, val key: String)
-    private fun preLoginSync(): PubKey? {
+    /**
+     * Password key, in the order current clients try it: `launcher/sync/` headers, then
+     * `qe/sync/` headers, then the web login page. A transport failure is remembered so a
+     * total miss can be reported as unreachable rather than a missing key.
+     */
+    private fun fetchPasswordKey(): InstagramLogin.EncryptionKey? {
+        var reached = false
+        var lastIo: IOException? = null
+        for (endpoint in listOf("launcher/sync/", "qe/sync/")) {
+            try {
+                val key = appKeyFrom(endpoint)
+                reached = true
+                if (key != null) return key
+            } catch (e: IOException) {
+                lastIo = e
+            }
+        }
+        try {
+            val key = webKey()
+            reached = true
+            if (key != null) return key
+        } catch (e: IOException) {
+            lastIo = e
+        }
+        if (!reached) throw lastIo ?: IOException("network")
+        return null
+    }
+
+    private fun appKeyFrom(endpoint: String): InstagramLogin.EncryptionKey? {
         val body = JSONObject().apply {
             put("id", device.deviceId)
             put("server_config_retrieval", "1")
         }
-        val req = Request.Builder().url("$base/qe/sync/").post(signedBody(body)).commonHeaders()
+        val req = Request.Builder().url("$base/$endpoint").post(signedBody(body)).commonHeaders()
             .header("X-DEVICE-ID", device.deviceId).build()
         http.newCall(req).execute().use { resp ->
             capture(resp)
-            val id = resp.header("ig-set-password-encryption-key-id")?.toIntOrNull()
-            val key = resp.header("ig-set-password-encryption-pub-key")
             resp.body?.close()
-            if (id != null && key != null) return PubKey(id, key)
+            return InstagramLogin.encryptionKeyFromHeaders(
+                resp.header("ig-set-password-encryption-key-id"),
+                resp.header("ig-set-password-encryption-pub-key"),
+            )
         }
-        return null
+    }
+
+    /** GET the web login page. No credentials. Reads the CSRF cookie and the browser public key. */
+    private fun webKey(): InstagramLogin.EncryptionKey? {
+        val req = Request.Builder().url(webLogin)
+            .header("User-Agent", InstagramDevice.WEB_USER_AGENT)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .get().build()
+        http.newCall(req).execute().use { resp ->
+            val cookies = resp.headers("Set-Cookie")
+            val html = resp.body?.string().orEmpty()
+            val page = InstagramLogin.parseWebLoginPage(html, cookies)
+            webSprinkleName = page.sprinkleName
+            webSprinkleVersion = page.sprinkleVersion
+            webSprinkleRandomize = page.sprinkleRandomize
+            webRollout = page.rolloutHash
+            page.csrf?.let { account.csrfToken = it }
+            return page.key
+        }
     }
 
     fun login(username: String, password: String): LoginResult {
-        val pub = preLoginSync() ?: return LoginResult.Error("Couldn't reach Instagram (no key)")
-        val enc = InstagramCrypto.encryptPassword(password, pub.id, pub.key)
+        pendingWebLogin = false
+        val key = try {
+            fetchPasswordKey()
+        } catch (e: IOException) {
+            return LoginResult.Error("${InstagramLogin.MSG_UNREACHABLE} ${e.message.orEmpty()}".trim())
+        } ?: return LoginResult.Error(InstagramLogin.MSG_NO_KEY)
+        return try {
+            if (key.kind == InstagramLogin.KeyKind.WEB) {
+                pendingWebLogin = true
+                val enc = InstagramLogin.encryptBrowserPassword(password, key.id, key.key)
+                webPasswordLogin(username, enc)
+            } else {
+                val enc = InstagramCrypto.encryptPassword(password, key.id, key.key)
+                mobilePasswordLogin(username, enc)
+            }
+        } catch (e: IOException) {
+            LoginResult.Error("${InstagramLogin.MSG_UNREACHABLE} ${e.message.orEmpty()}".trim())
+        }
+    }
+
+    private fun mobilePasswordLogin(username: String, enc: String): LoginResult {
         val payload = JSONObject().apply {
             put("jazoest", InstagramCrypto.jazoest(device.phoneId))
             put("country_codes", JSONArray().put(JSONObject().apply {
@@ -120,51 +197,104 @@ class InstagramApi(
             .commonHeaders().build()
         http.newCall(req).execute().use { resp ->
             capture(resp)
-            val txt = resp.body?.string().orEmpty()
-            val j = runCatching { JSONObject(txt) }.getOrNull()
-                ?: return LoginResult.Error("Bad response (${resp.code})")
-            if (j.optString("status") == "ok" && j.has("logged_in_user")) {
-                account.userId = j.getJSONObject("logged_in_user").get("pk").toString()
-                account.username = j.getJSONObject("logged_in_user").optString("username", username)
-                Log.i(TAG, "logged in as ${account.username} (${account.userId})")
-                return LoginResult.Success
-            }
-            if (j.optBoolean("two_factor_required")) {
-                val info = j.optJSONObject("two_factor_info")
-                return LoginResult.TwoFactor(
-                    info?.optString("two_factor_identifier").orEmpty(),
-                    info?.optString("username").ifBlankOr(username),
-                )
-            }
-            if (j.optString("message") == "challenge_required") {
-                val path = j.optJSONObject("challenge")?.optString("api_path").orEmpty()
-                return LoginResult.Challenge(path)
-            }
-            return LoginResult.Error(j.optString("message").ifBlankOr(j.optString("error_type", "Login failed")))
+            return applyLogin(username, resp.code, resp.body?.string().orEmpty())
         }
     }
 
-    fun submitTwoFactor(code: String, identifier: String, username: String): LoginResult {
+    private fun webPasswordLogin(username: String, enc: String): LoginResult {
+        val csrf = account.csrfToken
+            ?: return LoginResult.Error("Instagram's web login page did not include a CSRF token.")
+        val form = FormBody.Builder()
+            .add("caaF2DebugGroup", "-1")
+            .add("enc_password", enc)
+            .add("isPrivacyPortalReq", "false")
+            .add("loginAttemptSubmissionCount", "0")
+            .add("optIntoOneTap", "false")
+            .add("queryParams", "{}")
+            .add("stopDeletionNonce", "")
+            .add("trustedDeviceRecords", "{}")
+            .add("username", username)
+        webSprinkleName?.let { name ->
+            form.add(name, InstagramLogin.sprinkleToken(csrf, webSprinkleVersion, webSprinkleRandomize))
+        }
+        val req = webLoginRequest("$webAjax", form.build(), csrf).build()
+        http.newCall(req).execute().use { resp ->
+            capture(resp)
+            return applyLogin(username, resp.code, resp.body?.string().orEmpty())
+        }
+    }
+
+    private fun webLoginRequest(url: String, body: FormBody, csrf: String): Request.Builder {
+        val builder = Request.Builder().url(url).post(body)
+            .header("User-Agent", InstagramDevice.WEB_USER_AGENT)
+            .header("X-CSRFToken", csrf)
+            .header("X-IG-App-ID", InstagramDevice.WEB_APP_ID)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Referer", webLogin)
+            .header("Origin", "https://www.instagram.com")
+            .header("X-IG-WWW-Claim", account.wwwClaim ?: "0")
+            .header("Cookie", "csrftoken=$csrf")
+        webRollout?.let { builder.header("X-Instagram-AJAX", it) }
+        return builder
+    }
+
+    private fun applyLogin(username: String, code: Int, body: String): LoginResult =
+        when (val c = InstagramLogin.classify(code, body)) {
+            is InstagramLogin.Classified.Success -> {
+                account.userId = c.userId
+                account.username = c.username.ifBlank { username }
+                Log.i(TAG, "logged in as ${account.username} (${account.userId})")
+                LoginResult.Success
+            }
+            is InstagramLogin.Classified.TwoFactor -> LoginResult.TwoFactor(
+                c.identifier, c.username.ifBlankOr(username), c.method,
+            )
+            is InstagramLogin.Classified.Challenge -> LoginResult.Challenge(c.apiPath, c.message)
+            is InstagramLogin.Classified.Failure -> LoginResult.Error(c.message)
+        }
+
+    fun submitTwoFactor(code: String, identifier: String, username: String, method: String = "SMS"): LoginResult =
+        try {
+            if (pendingWebLogin) webTwoFactor(code, identifier, username, method)
+            else mobileTwoFactor(code, identifier, username, method)
+        } catch (e: IOException) {
+            LoginResult.Error("${InstagramLogin.MSG_UNREACHABLE} ${e.message.orEmpty()}".trim())
+        }
+
+    private fun mobileTwoFactor(code: String, identifier: String, username: String, method: String): LoginResult {
         val payload = JSONObject().apply {
             put("verification_code", code)
             put("two_factor_identifier", identifier)
             put("username", username)
             put("device_id", device.androidId)
             put("guid", device.deviceId)
-            put("verification_method", "1")
+            put("verification_method", if (method == "authenticator") "3" else "1")
         }
         val req = Request.Builder().url("$base/accounts/two_factor_login/").post(signedBody(payload))
             .commonHeaders().build()
         http.newCall(req).execute().use { resp ->
             capture(resp)
-            val j = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull()
-                ?: return LoginResult.Error("Bad 2FA response")
-            if (j.optString("status") == "ok" && j.has("logged_in_user")) {
-                account.userId = j.getJSONObject("logged_in_user").get("pk").toString()
-                account.username = j.getJSONObject("logged_in_user").optString("username", username)
-                return LoginResult.Success
-            }
-            return LoginResult.Error(j.optString("message").ifBlankOr("Invalid code"))
+            return applyLogin(username, resp.code, resp.body?.string().orEmpty())
+        }
+    }
+
+    private fun webTwoFactor(code: String, identifier: String, username: String, method: String): LoginResult {
+        val csrf = account.csrfToken
+            ?: return LoginResult.Error("Instagram's web login page did not include a CSRF token.")
+        val form = FormBody.Builder()
+            .add("identifier", identifier)
+            .add("queryParams", "{}")
+            .add("trust_signal", "true")
+            .add("username", username)
+            .add("verificationCode", code)
+            .add("verification_method", if (method == "authenticator") "3" else "1")
+        webSprinkleName?.let { name ->
+            form.add(name, InstagramLogin.sprinkleToken(csrf, webSprinkleVersion, webSprinkleRandomize))
+        }
+        val req = webLoginRequest("${webAjax}two_factor/", form.build(), csrf).build()
+        http.newCall(req).execute().use { resp ->
+            capture(resp)
+            return applyLogin(username, resp.code, resp.body?.string().orEmpty())
         }
     }
 
