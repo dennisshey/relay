@@ -100,6 +100,55 @@ class OutboxRetryTest {
         assertEquals(old.firstAttemptAt, harness.store.messages.single().firstAttemptAt)
     }
 
+    @Test fun twoManualRetriesSendOnce() {
+        val now = 9_000_000L
+        val row = failed(id = 44, firstAttemptAt = now - OutboxPolicy.AUTO_RETRY_WINDOW_MS - 60_000, timestamp = 50)
+        val harness = harness(row)
+        harness.transport.fail = false
+        val convo = harness.store.conversations.single()
+        runBlocking {
+            harness.sweeper.retryManually(convo, row)
+            harness.sweeper.retryManually(convo, row)
+        }
+        assertEquals(listOf(44L), harness.transport.sent)
+        assertEquals(MessageStatus.SENT, harness.store.messages.single().status)
+    }
+
+    @Test fun manualRetryAfterASuccessfulAutoRetrySendsNothing() {
+        val now = 5_000_000L
+        val row = failed(id = 45, firstAttemptAt = now - 1_000, timestamp = 1)
+        val harness = harness(row)
+        harness.transport.fail = false
+        runBlocking {
+            harness.sweeper.flush(now)
+            assertEquals(listOf(45L), harness.transport.sent)
+            val result = harness.sweeper.retryManually(harness.store.conversations.single(), row)
+            assertTrue(result.isSuccess)
+        }
+        assertEquals(listOf(45L), harness.transport.sent)
+    }
+
+    @Test fun aClockStepBackwardDoesNotRetry() {
+        val started = 1_700_000_000_000L
+        val now = started - 3_600_000L
+        assertTrue(!OutboxPolicy.eligibleForAutoRetry(started, now))
+        val harness = harness(failed(id = 46, firstAttemptAt = started, timestamp = 1))
+        runBlocking { harness.sweeper.flush(now) }
+        assertEquals(emptyList<Long>(), harness.transport.sent)
+        assertEquals(MessageStatus.FAILED, harness.store.messages.single().status)
+    }
+
+    @Test fun startupRetryLeavesASignalSendThatBeganAfterLaunch() {
+        val startedAt = 1_000_000L
+        val harness = harness(
+            pending(id = 47, transportId = "signal", firstAttemptAt = startedAt + 30_000),
+            pending(id = 48, transportId = "imessage", firstAttemptAt = startedAt),
+        )
+        runBlocking { harness.sweeper.sweepAfterProcessStart(now = startedAt + 60_000, startedAt = startedAt) }
+        assertEquals(emptyList<Long>(), harness.transport.sent)
+        assertTrue(harness.store.messages.all { it.status == MessageStatus.PENDING })
+    }
+
     @Test fun inFlightRowPastTheWindowIsFailedAndNotSent() {
         val now = 4_000_000L
         val harness = harness(
@@ -200,6 +249,8 @@ private class FakeOutboxStore(val messages: MutableList<MessageEntity>) : Outbox
     override suspend fun pendingOutgoing(): List<MessageEntity> =
         messages.filter { it.outgoing && it.status == MessageStatus.PENDING }
             .sortedWith(compareBy({ it.timestamp }, { it.id }))
+
+    override suspend fun message(id: Long): MessageEntity? = messages.find { it.id == id }
 
     override suspend fun getConversation(id: Long): ConversationEntity? =
         conversations.find { it.id == id }

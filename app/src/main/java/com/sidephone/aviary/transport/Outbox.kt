@@ -61,12 +61,15 @@ class Outbox(
 
             // One startup sweep (process start, which is also what BOOT_COMPLETED and
             // MY_PACKAGE_REPLACED cause), then a slow periodic pass over whatever is still
-            // inside the window.
+            // inside the window. startedAt stays the original process start: a sweep that
+            // retries after the 60s delay must not treat a send begun in this process as
+            // interrupted.
+            val startedAt = System.currentTimeMillis()
             var swept = false
             while (isActive) {
                 val now = System.currentTimeMillis()
                 if (!swept) {
-                    val ok = runCatching { guardedSweep(now) }
+                    val ok = runCatching { guardedSweep(now, startedAt) }
                         .onFailure { Log.w(TAG, "outbox recovery failed", it) }
                         .isSuccess
                     if (ok) swept = true
@@ -95,8 +98,8 @@ class Outbox(
     suspend fun retryManually(conversation: ConversationEntity, message: MessageEntity): Result<Unit> =
         flushMutex.withLock { sweeper.retryManually(conversation, message) }
 
-    private suspend fun guardedSweep(now: Long) = flushMutex.withLock {
-        sweeper.sweepAfterProcessStart(now)
+    private suspend fun guardedSweep(now: Long, startedAt: Long) = flushMutex.withLock {
+        sweeper.sweepAfterProcessStart(now, startedAt)
     }
 
     private suspend fun guardedFlush(now: Long) = flushMutex.withLock {
@@ -130,10 +133,12 @@ internal object OutboxPolicy {
 
     const val MAX_AUTO_ATTEMPTS = 5
 
-    /** Null and non-positive timestamps are stale (pre-migration rows, or a missing stamp). */
+    /** Null and non-positive timestamps are stale (pre-migration rows, or a missing stamp).
+     *  A clock step backward (now < started) is not a fresh attempt. */
     fun eligibleForAutoRetry(firstAttemptAt: Long?, now: Long): Boolean {
         val started = firstAttemptAt ?: return false
         if (started <= 0L) return false
+        if (now < started) return false
         return now - started <= AUTO_RETRY_WINDOW_MS
     }
 }
@@ -141,6 +146,7 @@ internal object OutboxPolicy {
 internal interface OutboxStore {
     suspend fun failedOutgoing(): List<MessageEntity>
     suspend fun pendingOutgoing(): List<MessageEntity>
+    suspend fun message(id: Long): MessageEntity?
     suspend fun getConversation(id: Long): ConversationEntity?
     suspend fun setMessageStatus(id: Long, status: MessageStatus)
 }
@@ -148,6 +154,7 @@ internal interface OutboxStore {
 private class RoomOutboxStore(private val repo: UnifiedRepository) : OutboxStore {
     override suspend fun failedOutgoing() = repo.failedOutgoing()
     override suspend fun pendingOutgoing() = repo.pendingOutgoing()
+    override suspend fun message(id: Long) = repo.message(id)
     override suspend fun getConversation(id: Long) = repo.getConversation(id)
     override suspend fun setMessageStatus(id: Long, status: MessageStatus) = repo.setMessageStatus(id, status)
 }
@@ -161,8 +168,8 @@ internal class OutboxSweeper(
     private val transports: TransportRegistry,
     private val attempts: MutableMap<Long, Int> = ConcurrentHashMap(),
 ) {
-    suspend fun sweepAfterProcessStart(now: Long) {
-        expireStaleInFlight(now)
+    suspend fun sweepAfterProcessStart(now: Long, startedAt: Long = now) {
+        expireStaleInFlight(now, startedAt)
         flush(now)
     }
 
@@ -195,21 +202,31 @@ internal class OutboxSweeper(
     /**
      * Send [message] once. Does not refresh [MessageEntity.firstAttemptAt] and does not spend or
      * reset the automatic cap, so a stale row cannot fall back into the startup sweep.
+     *
+     * Reloads the row first. A second tap, or a tap queued behind an automatic retry that already
+     * succeeded, sees SENT (or anything other than FAILED) and does not send again.
      */
     suspend fun retryManually(conversation: ConversationEntity, message: MessageEntity): Result<Unit> {
-        val transport = transports.byId(message.transportId)
-            ?: return Result.failure(IllegalStateException("No transport for ${message.transportId}"))
-        return runCatching { transport.resend(conversation, message) }.getOrElse { Result.failure(it) }
+        val current = store.message(message.id) ?: return Result.success(Unit)
+        if (current.status != MessageStatus.FAILED) return Result.success(Unit)
+        val transport = transports.byId(current.transportId)
+            ?: return Result.failure(IllegalStateException("No transport for ${current.transportId}"))
+        return runCatching { transport.resend(conversation, current) }.getOrElse { Result.failure(it) }
     }
 
     suspend fun clearAutoAttempts(transportId: String) {
         store.failedOutgoing().filter { it.transportId == transportId }.forEach { attempts.remove(it.id) }
     }
 
-    private suspend fun expireStaleInFlight(now: Long) {
+    private suspend fun expireStaleInFlight(now: Long, startedAt: Long) {
         val pending = store.pendingOutgoing()
         for (msg in pending) {
-            val fresh = OutboxPolicy.eligibleForAutoRetry(msg.firstAttemptAt, now)
+            // Began in this process. The original send is still the one in flight; failing it
+            // here and resending would deliver a second copy. Matches the old
+            // `timestamp < startedAt` guard, including when this sweep retries a minute later.
+            val started = msg.firstAttemptAt
+            if (started != null && started >= startedAt) continue
+            val fresh = OutboxPolicy.eligibleForAutoRetry(started, now)
             if (!fresh || msg.transportId in INTERRUPT_RESUME_TRANSPORTS) {
                 // Past the window (or never stamped): mark FAILED and leave it for the flush,
                 // which will not send it. A fresh signal/iMessage PENDING is moved to FAILED so
