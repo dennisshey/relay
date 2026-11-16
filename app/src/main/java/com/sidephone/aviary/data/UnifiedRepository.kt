@@ -198,7 +198,8 @@ class UnifiedRepository(private val db: AviaryDatabase) {
      * re-syncs are safe. Bumps the conversation preview/unread counters.
      */
     suspend fun recordMessage(m: MessageEntity, countUnread: Boolean = !m.outgoing): Long {
-        val rowId = db.messages().insert(m)
+        val stored = withFirstAttemptAt(m)
+        val rowId = db.messages().insert(stored)
         if (rowId <= 0) return rowId // duplicate from a re-sync
         val convo = db.conversations().get(m.conversationId) ?: return rowId
         // A deleted (hidden) thread stays hidden for old re-deliveries, but a genuinely new
@@ -247,16 +248,18 @@ class UnifiedRepository(private val db: AviaryDatabase) {
         if (msg.sender != sender) db.messages().setSender(msg.id, sender)
     }
 
-    /** Outgoing messages that failed to send — the offline outbox, oldest first. */
-    suspend fun recoverInterruptedSends(startedAt: Long) = db.messages().recoverInterruptedSends(startedAt)
-
     suspend fun pendingAttachmentPaths(): Set<String> =
         (db.messages().outgoingWithStatus(MessageStatus.PENDING) +
             db.messages().outgoingWithStatus(MessageStatus.FAILED))
             .mapNotNull { it.mediaPath }.toSet()
 
+    /** Outgoing messages that failed to send — the offline outbox, oldest first. */
     suspend fun failedOutgoing(): List<MessageEntity> =
         db.messages().outgoingWithStatus(MessageStatus.FAILED)
+
+    /** Outgoing rows still marked in-flight. There is no SENDING status; PENDING is that state. */
+    suspend fun pendingOutgoing(): List<MessageEntity> =
+        db.messages().outgoingWithStatus(MessageStatus.PENDING)
 
     suspend fun message(id: Long): MessageEntity? = db.messages().byId(id)
 
@@ -336,6 +339,16 @@ class UnifiedRepository(private val db: AviaryDatabase) {
 
     suspend fun knownExternalIds(transportId: String): Set<String> =
         db.messages().knownExternalIds(transportId).toSet()
+}
+
+/**
+ * Stamp [MessageEntity.firstAttemptAt] the first time an outgoing row is stored. A timestamp of 0
+ * is not a real attempt time. Rows that already have one, and incoming rows, are left alone.
+ */
+internal fun withFirstAttemptAt(message: MessageEntity, now: Long = System.currentTimeMillis()): MessageEntity {
+    if (!message.outgoing || message.firstAttemptAt != null) return message
+    val started = message.timestamp.takeIf { it > 0L } ?: now
+    return message.copy(firstAttemptAt = started)
 }
 
 /** Inbox preview label for an attachment-only message. */

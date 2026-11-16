@@ -477,8 +477,8 @@ fun ThreadScreen(app: RelayApp, conversationId: Long, onBack: () -> Unit, onOpen
                             onRetry = {
                                 scope.launch {
                                     convo?.let { c ->
-                                        // Resend the existing row in place (keeps its spot, media, reply).
-                                        app.transports.byId(msg.transportId)?.resend(c, msg)?.onFailure { e ->
+                                        // One manual send. Does not re-arm automatic retry for a stale row.
+                                        app.outbox.retryManually(c, msg).onFailure { e ->
                                             snackbar.showSnackbar(e.message ?: "Send failed")
                                         }
                                     }

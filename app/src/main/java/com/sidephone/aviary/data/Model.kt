@@ -118,6 +118,13 @@ data class MessageEntity(
     val replyToExternalId: String? = null,
     /** Short preview of the replied-to message, for the quoted line. */
     val replyToPreview: String? = null,
+    /**
+     * Unix millis of the first send attempt for an outgoing row. Null on incoming messages and on
+     * every row written before this column existed. The outbox treats null (and non-positive) as
+     * stale and will not auto-resend those after an update, reboot, or process start. Manual retry
+     * does not rewrite it.
+     */
+    val firstAttemptAt: Long? = null,
 )
 
 /**
@@ -322,9 +329,6 @@ interface MessageDao {
     @Query("SELECT externalId FROM messages WHERE conversationId = :conversationId AND outgoing = 0 AND externalId IS NOT NULL ORDER BY timestamp DESC, id DESC LIMIT 1")
     suspend fun latestIncomingExternalId(conversationId: Long): String?
 
-    @Query("UPDATE messages SET status = 'FAILED' WHERE outgoing = 1 AND status = 'PENDING' AND timestamp < :startedAt AND transportId IN ('signal', 'imessage')")
-    suspend fun recoverInterruptedSends(startedAt: Long)
-
     /** The offline outbox: outgoing messages that failed to send, oldest first, for auto-retry. */
     @Query("SELECT * FROM messages WHERE outgoing = 1 AND status = :status ORDER BY timestamp ASC, id ASC")
     suspend fun outgoingWithStatus(status: MessageStatus): List<MessageEntity>
@@ -382,7 +386,7 @@ interface MessageDao {
 
 @Database(
     entities = [ConversationEntity::class, MessageEntity::class, LinkPreviewEntity::class],
-    version = 11,
+    version = 12,
     exportSchema = false
 )
 abstract class AviaryDatabase : RoomDatabase() {
@@ -454,6 +458,25 @@ private fun androidx.sqlite.db.SupportSQLiteDatabase.addColumnIfMissing(
         return
     }
     execSQL("ALTER TABLE `$table` ADD COLUMN `$column` $type")
+}
+
+/**
+ * SQL for [MIGRATION_11_12]. Existing rows are left NULL on purpose: a missing first-attempt
+ * time is stale, so installing this build cannot flush the historical failed-message backlog.
+ */
+internal const val ADD_FIRST_ATTEMPT_AT_SQL =
+    "ALTER TABLE `messages` ADD COLUMN `firstAttemptAt` INTEGER"
+
+internal fun addFirstAttemptAtColumn(columns: Set<String>, exec: (String) -> Unit) {
+    if ("firstAttemptAt" in columns) return
+    exec(ADD_FIRST_ATTEMPT_AT_SQL)
+}
+
+/** v12 stores the first send-attempt time. See [ADD_FIRST_ATTEMPT_AT_SQL]. */
+val MIGRATION_11_12 = object : androidx.room.migration.Migration(11, 12) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        addFirstAttemptAtColumn(db.columnsOf("messages"), db::execSQL)
+    }
 }
 
 /** v11 adds the link-preview cache. */
