@@ -24,9 +24,10 @@ import javax.crypto.spec.SecretKeySpec
  * Kept free of Android types so the header, fallback, and challenge paths can be tested
  * with synthetic responses.
  *
- * The mobile key comes from `ig-set-password-encryption-*` on `launcher/sync/` (and, if that
- * omits them, `qe/sync/`). The web fallback reads `InstagramPasswordEncryption` out of the
- * login HTML and seals the password as `#PWD_INSTAGRAM_BROWSER:10`.
+ * The password key is read from the instagram.com login page first (`InstagramPasswordEncryption`)
+ * and the password is sealed as `#PWD_INSTAGRAM_BROWSER:10`. The private `launcher/sync/` and
+ * `qe/sync/` headers are only a fallback: posting that key to `accounts/login/` is rejected as
+ * an out-of-date app for every pinned Android version.
  */
 object InstagramLogin {
 
@@ -68,12 +69,41 @@ object InstagramLogin {
         return EncryptionKey(id, key, KeyKind.APP)
     }
 
+    const val WEB_LOGIN_URL = "https://www.instagram.com/accounts/login/"
+
     /**
      * Order [InstagramApi] uses when asking Instagram for a password key.
-     * `launcher/sync/` is what current clients read; `qe/sync/` is the old call;
-     * `web` is the login-page fallback.
+     * `web` is the instagram.com login page. `launcher/sync/` and `qe/sync/` are the private
+     * Android calls, used only when the page has no key.
      */
-    val PASSWORD_KEY_SOURCES = listOf("launcher/sync/", "qe/sync/", "web")
+    val PASSWORD_KEY_SOURCES = listOf("web", "launcher/sync/", "qe/sync/")
+
+    /** GET headers for the login page. A browser user agent, not the Android app. */
+    fun webPageHeaders(userAgent: String): Map<String, String> = linkedMapOf(
+        "User-Agent" to userAgent,
+        "Accept" to "text/html,application/xhtml+xml",
+    )
+
+    /** POST headers for the website login and its 2FA submit. */
+    fun webLoginHeaders(
+        userAgent: String,
+        csrf: String,
+        wwwClaim: String,
+        rollout: String?,
+    ): Map<String, String> {
+        val headers = linkedMapOf(
+            "User-Agent" to userAgent,
+            "X-CSRFToken" to csrf,
+            "X-IG-App-ID" to InstagramDevice.WEB_APP_ID,
+            "X-Requested-With" to "XMLHttpRequest",
+            "Referer" to WEB_LOGIN_URL,
+            "Origin" to "https://www.instagram.com",
+            "X-IG-WWW-Claim" to wwwClaim,
+            "Cookie" to "csrftoken=$csrf",
+        )
+        if (!rollout.isNullOrBlank()) headers["X-Instagram-AJAX"] = rollout
+        return headers
+    }
 
     /** First source that returns a key wins. A null fetch means "try the next source." */
     fun fetchPasswordKey(fetch: (String) -> EncryptionKey?): EncryptionKey? {

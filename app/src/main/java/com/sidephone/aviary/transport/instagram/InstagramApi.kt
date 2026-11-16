@@ -16,8 +16,10 @@ import java.util.concurrent.TimeUnit
 /**
  * Thin client over Instagram's private mobile API (i.instagram.com/api/v1). Presents the fake
  * device from [InstagramDevice] and the saved session from [InstagramAccount] on every call, and
- * captures the rotating auth headers Instagram hands back. Covers login (with the enc_password
- * flow + 2FA/checkpoint detection), the DM inbox, thread history, and sending text.
+ * captures the rotating auth headers Instagram hands back. Login uses the instagram.com website
+ * with the device's browser user agent — the legacy `accounts/login/` endpoint answers every
+ * Android app version with "out of date". Covers the enc_password flow + 2FA/checkpoint
+ * detection, the DM inbox, thread history, and sending text.
  */
 class InstagramApi(
     private val device: InstagramDevice,
@@ -29,7 +31,7 @@ class InstagramApi(
         .build()
 
     private val base = "https://i.instagram.com/api/v1"
-    private val webLogin = "https://www.instagram.com/accounts/login/"
+    private val webLogin = InstagramLogin.WEB_LOGIN_URL
     private val webAjax = "https://www.instagram.com/api/v1/web/accounts/login/ajax/"
 
     private var pendingWebLogin = false
@@ -94,9 +96,8 @@ class InstagramApi(
     // ---- login -------------------------------------------------------------
 
     /**
-     * Password key, in the order current clients try it: `launcher/sync/` headers, then
-     * `qe/sync/` headers, then the web login page. A transport failure is remembered so a
-     * total miss can be reported as unreachable rather than a missing key.
+     * Password key, web page first, then `launcher/sync/` and `qe/sync/`. A transport failure
+     * is remembered so a total miss can be reported as unreachable rather than a missing key.
      */
     private fun fetchPasswordKey(): InstagramLogin.EncryptionKey? {
         var reached = false
@@ -134,10 +135,9 @@ class InstagramApi(
 
     /** GET the web login page. No credentials. Reads the CSRF cookie and the browser public key. */
     private fun webKey(): InstagramLogin.EncryptionKey? {
-        val req = Request.Builder().url(webLogin)
-            .header("User-Agent", InstagramDevice.WEB_USER_AGENT)
-            .header("Accept", "text/html,application/xhtml+xml")
-            .get().build()
+        val req = Request.Builder().url(webLogin).get()
+            .applyHeaders(InstagramLogin.webPageHeaders(device.browserUserAgent()))
+            .build()
         http.newCall(req).execute().use { resp ->
             val cookies = resp.headers("Set-Cookie")
             val html = resp.body?.string().orEmpty()
@@ -218,18 +218,18 @@ class InstagramApi(
         }
     }
 
-    private fun webLoginRequest(url: String, body: FormBody, csrf: String): Request.Builder {
-        val builder = Request.Builder().url(url).post(body)
-            .header("User-Agent", InstagramDevice.WEB_USER_AGENT)
-            .header("X-CSRFToken", csrf)
-            .header("X-IG-App-ID", InstagramDevice.WEB_APP_ID)
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header("Referer", webLogin)
-            .header("Origin", "https://www.instagram.com")
-            .header("X-IG-WWW-Claim", account.wwwClaim ?: "0")
-            .header("Cookie", "csrftoken=$csrf")
-        webRollout?.let { builder.header("X-Instagram-AJAX", it) }
-        return builder
+    private fun webLoginRequest(url: String, body: FormBody, csrf: String): Request.Builder =
+        Request.Builder().url(url).post(body).applyHeaders(
+            InstagramLogin.webLoginHeaders(
+                userAgent = device.browserUserAgent(),
+                csrf = csrf,
+                wwwClaim = account.wwwClaim ?: "0",
+                rollout = webRollout,
+            ),
+        )
+
+    private fun Request.Builder.applyHeaders(headers: Map<String, String>): Request.Builder = apply {
+        headers.forEach { (name, value) -> header(name, value) }
     }
 
     private fun applyLogin(username: String, code: Int, body: String): LoginResult =
