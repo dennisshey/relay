@@ -37,7 +37,8 @@ class InstagramAccount(context: Context) {
     var csrfToken: String? by str("csrf_token")
     var rur: String? by str("rur")
 
-    val isLoggedIn: Boolean get() = authorization != null && userId != null
+    /** A mobile bearer or a web session cookie is enough to resume. */
+    val isLoggedIn: Boolean get() = userId != null && (authorization != null || !sessionId.isNullOrBlank())
 
     fun clear() = prefs.edit().clear().apply()
 }

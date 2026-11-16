@@ -2,6 +2,7 @@ package com.sidephone.aviary.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -15,6 +16,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -31,6 +33,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.sidephone.aviary.RelayApp
+import com.sidephone.aviary.transport.instagram.InstagramLogin
 import com.sidephone.aviary.transport.instagram.InstagramTransport
 import kotlinx.coroutines.launch
 
@@ -76,11 +79,25 @@ fun InstagramLoginScreen(app: RelayApp, onBack: () -> Unit) {
                 }
 
                 is InstagramTransport.SetupState.AwaitingTwoFactor -> {
+                    var chosen by remember(s.method) {
+                        mutableStateOf(if (s.method == "either") null else s.method)
+                    }
                     Text("Enter the code", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "Instagram sent a 2FA code to ${s.username}'s trusted method.",
+                        InstagramLogin.twoFactorPrompt(s.method, s.username),
                         style = MaterialTheme.typography.bodyMedium,
                     )
+                    if (s.method == "either") {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            MethodChoice("SMS", chosen == "SMS", Modifier.weight(1f)) { chosen = "SMS" }
+                            MethodChoice("Authenticator", chosen == "authenticator", Modifier.weight(1f)) {
+                                chosen = "authenticator"
+                            }
+                        }
+                    }
                     OutlinedTextField(
                         value = code, onValueChange = { code = it.filter(Char::isDigit).take(8) },
                         label = { Text("6-digit code") }, singleLine = true,
@@ -88,11 +105,12 @@ fun InstagramLoginScreen(app: RelayApp, onBack: () -> Unit) {
                     )
                     error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     if (busy) CircularProgressIndicator() else Button(
-                        enabled = code.length >= 6,
+                        enabled = code.length >= 6 && chosen != null,
                         onClick = {
+                            val method = chosen ?: return@Button
                             busy = true; error = null
                             scope.launch {
-                                val r = transport.submitTwoFactor(code)
+                                val r = transport.submitTwoFactor(code, method)
                                 busy = false
                                 error = r.exceptionOrNull()?.message
                             }
@@ -142,5 +160,14 @@ fun InstagramLoginScreen(app: RelayApp, onBack: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun MethodChoice(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick = onClick, modifier = modifier) { Text(label) }
+    } else {
+        OutlinedButton(onClick = onClick, modifier = modifier) { Text(label) }
     }
 }

@@ -5,6 +5,8 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+val unitTestJson by configurations.creating
+
 android {
     namespace = "com.sidephone.aviary"
     compileSdk = 34
@@ -111,8 +113,16 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
+    // The Android unit-test android.jar stubs org.json. This copy is placed ahead of it.
+    "unitTestJson"("org.json:json:20240303")
     // In-memory SQLite for the v11 → v12 migration test. Unit tests don't ship a real Android DB.
     testImplementation("org.xerial:sqlite-jdbc:3.47.2.0")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test:runner:1.5.2")
+}
+
+tasks.withType<Test>().configureEach {
+    doFirst {
+        classpath = files(unitTestJson) + classpath
+    }
 }

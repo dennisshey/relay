@@ -35,29 +35,36 @@ class InstagramDevice(context: Context) {
     val phoneId: String get() = persistent("phone_id") { UUID.randomUUID().toString() }
     val familyDeviceId: String get() = persistent("family_id") { UUID.randomUUID().toString() }
 
-    // A concrete, common device profile (Pixel-class) baked into the User-Agent.
-    val appVersion = "269.0.0.18.75"
-    val appVersionCode = "314665256"
-    private val androidVersion = 30
-    private val androidRelease = "11"
-    private val dpi = "420dpi"
-    private val resolution = "1080x2340"
-    private val manufacturer = "Google"
-    private val model = "Pixel 4"
-    private val device = "flame"
-    private val cpu = "flame"
+    val appVersion = APP_VERSION
+    val appVersionCode = APP_VERSION_CODE
 
-    val userAgent: String get() =
-        "Instagram $appVersion Android ($androidVersion/$androidRelease; $dpi; $resolution; " +
-            "$manufacturer; $model; $device; $cpu; en_US; $appVersionCode)"
+    val userAgent: String get() = Companion.userAgent()
 
     companion object {
-        /** Instagram's web app id — what this client has always sent. */
-        const val APP_ID = "936619743392459"
+        // Instagram Android 454, the build mautrix-meta (2026-11-16) and igflare (2026-11-13)
+        // present. instagrapi 3.2.15 is one release behind, at 449. Bump these together.
+        const val APP_VERSION = "454.0.0.54.77"
+        const val APP_VERSION_CODE = "1105698528"
+        const val BLOKS_VERSION_ID = "8e8a63073c08f2c7e6701e497d777db5d8d7ad32a5788ce6b1094f20cad0c9f1"
+        const val ANDROID_VERSION = 34
+        const val ANDROID_RELEASE = "14"
+        const val DPI = "480dpi"
+        const val RESOLUTION = "1344x2992"
+        const val MANUFACTURER = "Google/google"
+        const val MODEL = "Pixel 8 Pro"
+        const val DEVICE = "husky"
+        const val CPU = "husky"
 
-        /** The Android app's id. The User-Agent here is the Android app's, so this is the
-         *  consistent pairing; some direct_v2 routes answer one and 404 the other. */
-        const val APP_ID_ANDROID = "567067343352427"
-        const val CAPABILITIES = "3brTvw=="
+        /** Android app id. Paired with [userAgent]; the web id is only for the browser fallback. */
+        const val APP_ID = "567067343352427"
+        const val APP_ID_ANDROID = APP_ID
+        const val WEB_APP_ID = "936619743392459"
+        const val CAPABILITIES = "3brTv10C"
+        const val WEB_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+        fun userAgent(): String =
+            "Instagram $APP_VERSION Android ($ANDROID_VERSION/$ANDROID_RELEASE; $DPI; $RESOLUTION; " +
+                "$MANUFACTURER; $MODEL; $DEVICE; $CPU; en_US; $APP_VERSION_CODE)"
     }
 }
