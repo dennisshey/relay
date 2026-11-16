@@ -101,24 +101,18 @@ class InstagramApi(
     private fun fetchPasswordKey(): InstagramLogin.EncryptionKey? {
         var reached = false
         var lastIo: IOException? = null
-        for (endpoint in listOf("launcher/sync/", "qe/sync/")) {
+        val key = InstagramLogin.fetchPasswordKey { source ->
             try {
-                val key = appKeyFrom(endpoint)
+                val found = if (source == "web") webKey() else appKeyFrom(source)
                 reached = true
-                if (key != null) return key
+                found
             } catch (e: IOException) {
                 lastIo = e
+                null
             }
         }
-        try {
-            val key = webKey()
-            reached = true
-            if (key != null) return key
-        } catch (e: IOException) {
-            lastIo = e
-        }
-        if (!reached) throw lastIo ?: IOException("network")
-        return null
+        if (key == null && !reached) throw lastIo ?: IOException("network")
+        return key
     }
 
     private fun appKeyFrom(endpoint: String): InstagramLogin.EncryptionKey? {
@@ -262,13 +256,15 @@ class InstagramApi(
         }
 
     private fun mobileTwoFactor(code: String, identifier: String, username: String, method: String): LoginResult {
+        val verification = InstagramLogin.verificationMethod(method)
+            ?: return LoginResult.Error(InstagramLogin.MSG_CHOOSE_2FA)
         val payload = JSONObject().apply {
             put("verification_code", code)
             put("two_factor_identifier", identifier)
             put("username", username)
             put("device_id", device.androidId)
             put("guid", device.deviceId)
-            put("verification_method", if (method == "authenticator") "3" else "1")
+            put("verification_method", verification)
         }
         val req = Request.Builder().url("$base/accounts/two_factor_login/").post(signedBody(payload))
             .commonHeaders().build()
@@ -281,13 +277,15 @@ class InstagramApi(
     private fun webTwoFactor(code: String, identifier: String, username: String, method: String): LoginResult {
         val csrf = account.csrfToken
             ?: return LoginResult.Error("Instagram's web login page did not include a CSRF token.")
+        val verification = InstagramLogin.verificationMethod(method)
+            ?: return LoginResult.Error(InstagramLogin.MSG_CHOOSE_2FA)
         val form = FormBody.Builder()
             .add("identifier", identifier)
             .add("queryParams", "{}")
             .add("trust_signal", "true")
             .add("username", username)
             .add("verificationCode", code)
-            .add("verification_method", if (method == "authenticator") "3" else "1")
+            .add("verification_method", verification)
         webSprinkleName?.let { name ->
             form.add(name, InstagramLogin.sprinkleToken(csrf, webSprinkleVersion, webSprinkleRandomize))
         }

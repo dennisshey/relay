@@ -33,6 +33,8 @@ object InstagramLogin {
     const val MSG_NO_KEY = "Instagram did not return a password encryption key."
     const val MSG_UNREACHABLE = "Couldn't reach Instagram."
     const val MSG_BAD_PASSWORD = "Wrong username or password."
+    const val MSG_UNKNOWN_USER = "No Instagram account uses that username."
+    const val MSG_CHOOSE_2FA = "Choose SMS or an authenticator code."
     const val MSG_RATE_LIMIT = "Instagram is rate-limiting this login. Wait a few minutes and try again."
     const val MSG_CHECKPOINT =
         "Instagram needs a checkpoint verification before this login can continue. Approve it in the Instagram app, then try again."
@@ -67,18 +69,18 @@ object InstagramLogin {
     }
 
     /**
-     * Prefer the mobile header key. When those headers are missing, use a version-10 key
-     * embedded in the web login page.
+     * Order [InstagramApi] uses when asking Instagram for a password key.
+     * `launcher/sync/` is what current clients read; `qe/sync/` is the old call;
+     * `web` is the login-page fallback.
      */
-    fun resolvePasswordKey(
-        idHeader: String?,
-        keyHeader: String?,
-        webHtml: String? = null,
-        setCookies: List<String> = emptyList(),
-    ): EncryptionKey? {
-        encryptionKeyFromHeaders(idHeader, keyHeader)?.let { return it }
-        if (webHtml.isNullOrBlank()) return null
-        return parseWebLoginPage(webHtml, setCookies).key
+    val PASSWORD_KEY_SOURCES = listOf("launcher/sync/", "qe/sync/", "web")
+
+    /** First source that returns a key wins. A null fetch means "try the next source." */
+    fun fetchPasswordKey(fetch: (String) -> EncryptionKey?): EncryptionKey? {
+        for (source in PASSWORD_KEY_SOURCES) {
+            fetch(source)?.let { return it }
+        }
+        return null
     }
 
     fun parseWebLoginPage(html: String, setCookies: List<String> = emptyList()): WebPage {
@@ -162,6 +164,12 @@ object InstagramLogin {
         if (bad) {
             return Classified.Failure(if (sentence(message)) message else MSG_BAD_PASSWORD)
         }
+        if (json.has("user") && !json.optBoolean("user")) {
+            return Classified.Failure(if (sentence(message)) message else MSG_UNKNOWN_USER)
+        }
+        if (json.has("authenticated") && !json.optBoolean("authenticated")) {
+            return Classified.Failure(if (sentence(message)) message else MSG_BAD_PASSWORD)
+        }
         val fallback = message.ifBlank { errorType }.ifBlank { "Login failed (HTTP $httpCode)." }
         return Classified.Failure(fallback)
     }
@@ -169,7 +177,31 @@ object InstagramLogin {
     fun twoFactorPrompt(method: String, username: String): String = when (method) {
         "SMS" -> "Instagram sent an SMS code for $username. Enter it to finish logging in."
         "authenticator" -> "Enter the code from the authenticator app for $username."
+        "either" -> "Choose SMS or an authenticator app for $username, then enter that code."
         else -> "Enter the SMS or authenticator code Instagram is asking for on $username."
+    }
+
+    /** Instagram's `verification_method`: 1 is SMS, 3 is TOTP. "either" is not a method. */
+    fun verificationMethod(method: String): String? = when (method) {
+        "SMS" -> "1"
+        "authenticator" -> "3"
+        else -> null
+    }
+
+    /** Message shown after a 2FA submit. A checkpoint keeps its own text. */
+    fun twoFactorSubmitMessage(
+        success: Boolean,
+        challengeMessage: String?,
+        errorMessage: String?,
+        stillTwoFactor: Boolean,
+        method: String,
+        username: String,
+    ): String? = when {
+        success -> null
+        challengeMessage != null -> challengeMessage
+        errorMessage != null -> errorMessage
+        stillTwoFactor -> twoFactorPrompt(method, username)
+        else -> null
     }
 
     /** `#PWD_INSTAGRAM_BROWSER:10:{ts}:{base64}` — NaCl box of an AES-GCM session key. */
@@ -178,7 +210,9 @@ object InstagramLogin {
         require(peer.size == 32) { "web public key must be 32 bytes" }
         val timestamp = (System.currentTimeMillis() / 1000).toString()
         val aesKey = ByteArray(32).also { SecureRandom().nextBytes(it) }
-        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        // PolarisEnvelopeEncryption and mautrix-meta encryptAESGCM (pkg/messagix/crypto/aes.go,
+        // e4dcf718, 2026-11-16) seal with a 12-byte zero nonce. The envelope has no IV slot.
+        val iv = ByteArray(12)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(aesKey, "AES"), GCMParameterSpec(128, iv))
         cipher.updateAAD(timestamp.toByteArray(Charsets.UTF_8))
@@ -214,6 +248,26 @@ object InstagramLogin {
         val tag = ByteArray(16)
         mac.doFinal(tag, 0)
         return tag + ct
+    }
+
+    /** Inverse of [secretboxSeal]. Returns null when the Poly1305 tag does not match. */
+    fun secretboxOpen(box: ByteArray, nonce: ByteArray, key: ByteArray): ByteArray? {
+        if (box.size < 16) return null
+        val tag = box.copyOfRange(0, 16)
+        val ct = box.copyOfRange(16, box.size)
+        val engine = XSalsa20Engine()
+        engine.init(true, ParametersWithIV(KeyParameter(key), nonce))
+        val stream = ByteArray(32 + ct.size)
+        engine.processBytes(ByteArray(stream.size), 0, stream.size, stream, 0)
+        val mac = Poly1305()
+        mac.init(KeyParameter(stream.copyOfRange(0, 32)))
+        mac.update(ct, 0, ct.size)
+        val expected = ByteArray(16)
+        mac.doFinal(expected, 0)
+        if (!expected.contentEquals(tag)) return null
+        val out = ByteArray(ct.size)
+        for (i in ct.indices) out[i] = (stream[32 + i].toInt() xor ct[i].toInt()).toByte()
+        return out
     }
 
     /** HSalsa20, used to turn an X25519 shared secret into a secretbox key. */
@@ -346,7 +400,7 @@ object InstagramLogin {
         val sms = info.optBoolean("sms_two_factor_on")
         val totp = info.optBoolean("totp_two_factor_on")
         return when {
-            sms && totp -> "SMS or authenticator"
+            sms && totp -> "either"
             totp -> "authenticator"
             else -> "SMS"
         }

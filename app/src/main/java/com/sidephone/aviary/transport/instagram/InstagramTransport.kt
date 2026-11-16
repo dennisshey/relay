@@ -95,13 +95,29 @@ class InstagramTransport(
         }
     }
 
-    suspend fun submitTwoFactor(code: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun submitTwoFactor(code: String, method: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
         val s = _setup.value as? SetupState.AwaitingTwoFactor
             ?: return@withContext Result.failure(IllegalStateException("not awaiting 2FA"))
-        when (val r = api.submitTwoFactor(code, s.identifier, s.username, s.method)) {
+        val chosen = method ?: s.method
+        when (val r = api.submitTwoFactor(code, s.identifier, s.username, chosen)) {
             is InstagramApi.LoginResult.Success -> { onLoggedIn(); Result.success(Unit) }
-            is InstagramApi.LoginResult.Error -> Result.failure(IllegalStateException(r.message))
-            else -> Result.failure(IllegalStateException("2FA failed"))
+            else -> {
+                val message = InstagramLogin.twoFactorSubmitMessage(
+                    success = false,
+                    challengeMessage = (r as? InstagramApi.LoginResult.Challenge)?.message,
+                    errorMessage = (r as? InstagramApi.LoginResult.Error)?.message,
+                    stillTwoFactor = r is InstagramApi.LoginResult.TwoFactor,
+                    method = (r as? InstagramApi.LoginResult.TwoFactor)?.method ?: chosen,
+                    username = (r as? InstagramApi.LoginResult.TwoFactor)?.username ?: s.username,
+                ) ?: InstagramLogin.MSG_CHOOSE_2FA
+                if (r is InstagramApi.LoginResult.Challenge) {
+                    _setup.value = SetupState.Challenge(message)
+                    _status.value = TransportStatus.NeedsSetup(message)
+                } else if (r is InstagramApi.LoginResult.Error) {
+                    _status.value = TransportStatus.NeedsSetup(message)
+                }
+                Result.failure(IllegalStateException(message))
+            }
         }
     }
 
