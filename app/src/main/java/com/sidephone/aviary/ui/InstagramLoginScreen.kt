@@ -127,7 +127,7 @@ fun InstagramLoginScreen(app: RelayApp, onBack: () -> Unit) {
                 is InstagramTransport.SetupState.LoggedOut -> {
                     Text("Log in to Instagram", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "Meta has no official DM API, so this signs in as the mobile app. " +
+                        "Meta has no official DM API, so this signs in through instagram.com. " +
                             "Credentials are encrypted on-device and never sent to a relay.",
                         style = MaterialTheme.typography.bodySmall,
                     )

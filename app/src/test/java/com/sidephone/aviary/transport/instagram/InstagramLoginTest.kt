@@ -7,6 +7,7 @@ import org.bouncycastle.crypto.params.X25519KeyGenerationParameters
 import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.X25519PublicKeyParameters
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -27,9 +28,9 @@ class InstagramLoginTest {
         assertNull(InstagramLogin.encryptionKeyFromHeaders(null, null))
     }
 
-    @Test fun passwordKeyOrderIsLauncherThenQeThenWeb() {
+    @Test fun passwordKeyOrderIsWebThenLauncherThenQe() {
         assertEquals(
-            listOf("launcher/sync/", "qe/sync/", "web"),
+            listOf("web", "launcher/sync/", "qe/sync/"),
             InstagramLogin.PASSWORD_KEY_SOURCES,
         )
         val seen = mutableListOf<String>()
@@ -37,7 +38,7 @@ class InstagramLoginTest {
             seen += source
             if (source == "web") InstagramLogin.EncryptionKey(42, HEX_KEY, InstagramLogin.KeyKind.WEB) else null
         }
-        assertEquals(InstagramLogin.PASSWORD_KEY_SOURCES, seen)
+        assertEquals(listOf("web"), seen)
         assertEquals(InstagramLogin.KeyKind.WEB, web?.kind)
         assertEquals(42, web?.id)
 
@@ -50,9 +51,38 @@ class InstagramLoginTest {
                 null
             }
         }
-        assertEquals(listOf("launcher/sync/"), stopped)
+        assertEquals(listOf("web", "launcher/sync/"), stopped)
         assertEquals(InstagramLogin.KeyKind.APP, app?.kind)
         assertEquals("app-key", app?.key)
+    }
+
+    @Test fun webLoginHeadersUseABrowserUserAgent() {
+        val browser = InstagramDevice.WEB_USER_AGENT
+        assertFalse(browser.startsWith("Instagram "))
+        assertTrue(browser.contains("Chrome/"))
+        assertTrue(browser.contains("Mobile"))
+
+        val page = InstagramLogin.webPageHeaders(browser)
+        assertEquals(browser, page["User-Agent"])
+        assertEquals("text/html,application/xhtml+xml", page["Accept"])
+        assertFalse(page.containsKey("X-IG-App-ID"))
+        assertFalse(page.containsKey("X-IG-Capabilities"))
+        assertFalse(page.containsKey("X-Bloks-Version-Id"))
+
+        val login = InstagramLogin.webLoginHeaders(browser, "csrf-cookie", "0", "roll-1")
+        assertEquals(browser, login["User-Agent"])
+        assertEquals(InstagramDevice.WEB_APP_ID, login["X-IG-App-ID"])
+        assertEquals("936619743392459", login["X-IG-App-ID"])
+        assertFalse(login["X-IG-App-ID"] == InstagramDevice.APP_ID)
+        assertEquals("csrf-cookie", login["X-CSRFToken"])
+        assertEquals("csrftoken=csrf-cookie", login["Cookie"])
+        assertEquals(InstagramLogin.WEB_LOGIN_URL, login["Referer"])
+        assertEquals("https://www.instagram.com", login["Origin"])
+        assertEquals("roll-1", login["X-Instagram-AJAX"])
+        assertFalse(login.containsKey("X-IG-Capabilities"))
+        assertFalse(login.containsKey("X-Bloks-Version-Id"))
+        assertFalse(login.containsKey("X-IG-Android-ID"))
+        assertFalse(login["User-Agent"]!!.contains(InstagramDevice.APP_VERSION))
     }
 
     @Test fun webLoginPageSuppliesTheVersion10Key() {

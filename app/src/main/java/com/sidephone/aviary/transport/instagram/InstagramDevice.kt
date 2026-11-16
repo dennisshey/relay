@@ -1,6 +1,7 @@
 package com.sidephone.aviary.transport.instagram
 
 import android.content.Context
+import android.webkit.WebSettings
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import java.util.UUID
@@ -13,6 +14,8 @@ import kotlin.random.Random
  * sends so requests aren't flagged.
  */
 class InstagramDevice(context: Context) {
+
+    private val appContext = context.applicationContext
 
     private val prefs by lazy {
         val masterKey = MasterKey.Builder(context)
@@ -40,6 +43,24 @@ class InstagramDevice(context: Context) {
 
     val userAgent: String get() = Companion.userAgent()
 
+    /**
+     * User-Agent for the instagram.com login. The system WebView default is a normal mobile
+     * Chrome string, which is what the website expects. The legacy private `accounts/login/`
+     * call identifies as the Android app and is rejected as out of date for every pinned version.
+     */
+    fun browserUserAgent(): String {
+        cachedBrowserUserAgent?.let { return it }
+        val resolved = try {
+            WebSettings.getDefaultUserAgent(appContext)
+        } catch (_: Throwable) {
+            null
+        }?.takeIf { it.isNotBlank() } ?: WEB_USER_AGENT
+        cachedBrowserUserAgent = resolved
+        return resolved
+    }
+
+    @Volatile private var cachedBrowserUserAgent: String? = null
+
     companion object {
         // Instagram Android 454, the build mautrix-meta (2026-11-16) and igflare (2026-11-13)
         // present. instagrapi 3.2.15 is one release behind, at 449. Bump these together.
@@ -55,13 +76,20 @@ class InstagramDevice(context: Context) {
         const val DEVICE = "husky"
         const val CPU = "husky"
 
-        /** Android app id. Paired with [userAgent]; the web id is only for the browser fallback. */
+        /** Android app id. Paired with [userAgent] on private API calls after login. */
         const val APP_ID = "567067343352427"
         const val APP_ID_ANDROID = APP_ID
         const val WEB_APP_ID = "936619743392459"
         const val CAPABILITIES = "3brTv10C"
+
+        /**
+         * Fallback only, when [browserUserAgent] cannot read the system WebView user agent.
+         * A normal mobile Chrome UA — not an Instagram app version. Verified against
+         * www.instagram.com/accounts/login/ on 2026-11-16: the page still returns the
+         * version-10 password key.
+         */
         const val WEB_USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
         fun userAgent(): String =
             "Instagram $APP_VERSION Android ($ANDROID_VERSION/$ANDROID_RELEASE; $DPI; $RESOLUTION; " +
